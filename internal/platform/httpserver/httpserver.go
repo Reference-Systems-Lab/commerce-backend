@@ -106,6 +106,7 @@ func Run(ctx context.Context, srv *http.Server, ln net.Listener, log *slog.Logge
 	sctx, cancel := context.WithTimeout(context.Background(), ShutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(sctx); err != nil {
+		_ = srv.Close() // drop the requests that outlived the timeout
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	if err := <-errc; err != nil && !errors.Is(err, http.ErrServerClosed) {

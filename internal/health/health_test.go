@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Reference-Systems-Lab/commerce-backend/internal/health"
 	"github.com/Reference-Systems-Lab/commerce-backend/internal/platform/db"
@@ -43,5 +44,28 @@ func TestHealthFollowsPostgres(t *testing.T) {
 	}
 	if code, body := get(t, h); code != http.StatusServiceUnavailable || body.Status != "unavailable" {
 		t.Fatalf("stopped: %d %+v", code, body)
+	}
+}
+
+// blockingPinger never answers until its context ends, like a database that accepted the connection
+// and hung.
+type blockingPinger struct{}
+
+func (blockingPinger) Ping(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestHealthTimesOutOnAHungDatabase(t *testing.T) {
+	api, h := httpserver.NewAPI()
+	health.Register(api, blockingPinger{})
+	start := time.Now()
+	code, body := get(t, h)
+	took := time.Since(start)
+	if code != http.StatusServiceUnavailable || body.Status != "unavailable" {
+		t.Fatalf("%d %+v", code, body)
+	}
+	if took < health.PingTimeout || took > health.PingTimeout+time.Second {
+		t.Fatalf("answered after %v, want about %v", took, health.PingTimeout)
 	}
 }

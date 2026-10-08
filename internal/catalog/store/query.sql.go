@@ -9,6 +9,32 @@ import (
 	"context"
 )
 
+const insertProductIfMissing = `-- name: InsertProductIfMissing :exec
+INSERT INTO products (slug, name, price_amount, price_currency)
+SELECT $1::text, $2::text, $3::bigint, $4::char(3)
+WHERE NOT EXISTS (SELECT 1 FROM products WHERE slug = $1::text)
+ON CONFLICT (slug) DO NOTHING
+`
+
+type InsertProductIfMissingParams struct {
+	Slug          string
+	Name          string
+	PriceAmount   int64
+	PriceCurrency string
+}
+
+// Inserts a product only when its slug is new. INSERT … SELECT draws an id only for a row it actually
+// inserts, unlike ON CONFLICT, which uses one up on every attempt.
+func (q *Queries) InsertProductIfMissing(ctx context.Context, arg InsertProductIfMissingParams) error {
+	_, err := q.db.Exec(ctx, insertProductIfMissing,
+		arg.Slug,
+		arg.Name,
+		arg.PriceAmount,
+		arg.PriceCurrency,
+	)
+	return err
+}
+
 const listProducts = `-- name: ListProducts :many
 SELECT id, slug, name, price_amount, price_currency
 FROM products
@@ -58,29 +84,31 @@ func (q *Queries) ListProducts(ctx context.Context, arg ListProductsParams) ([]L
 	return items, nil
 }
 
-const upsertProduct = `-- name: UpsertProduct :exec
-INSERT INTO products (slug, name, price_amount, price_currency)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (slug) DO UPDATE
-SET name = EXCLUDED.name, price_amount = EXCLUDED.price_amount, price_currency = EXCLUDED.price_currency
-WHERE (products.name, products.price_amount, products.price_currency)
-    IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.price_amount, EXCLUDED.price_currency)
+const updateProduct = `-- name: UpdateProduct :execrows
+UPDATE products
+SET name = $1, price_amount = $2, price_currency = $3
+WHERE slug = $4
+  AND (name, price_amount, price_currency)
+      IS DISTINCT FROM ($1::text, $2::bigint, $3::char(3))
 `
 
-type UpsertProductParams struct {
-	Slug          string
+type UpdateProductParams struct {
 	Name          string
 	PriceAmount   int64
 	PriceCurrency string
+	Slug          string
 }
 
-// Inserts a product, or updates it by slug only when something changed, so reseeding is a no-op.
-func (q *Queries) UpsertProduct(ctx context.Context, arg UpsertProductParams) error {
-	_, err := q.db.Exec(ctx, upsertProduct,
-		arg.Slug,
+// Updates a product by slug only when something changed, so reseeding writes nothing.
+func (q *Queries) UpdateProduct(ctx context.Context, arg UpdateProductParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateProduct,
 		arg.Name,
 		arg.PriceAmount,
 		arg.PriceCurrency,
+		arg.Slug,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 
@@ -43,6 +44,10 @@ type listOutput struct {
 	Body ProductPage
 }
 
+// QueryTimeout bounds the list query, so a slow database fails requests instead of piling them up
+// on the connection pool.
+const QueryTimeout = 5 * time.Second
+
 // Lister reads products; *store.Queries satisfies it.
 type Lister interface {
 	ListProducts(ctx context.Context, arg store.ListProductsParams) ([]store.ListProductsRow, error)
@@ -63,6 +68,8 @@ func Register(api huma.API, q Lister) {
 		if err != nil {
 			return nil, huma.Error400BadRequest("cursor is malformed")
 		}
+		ctx, cancel := context.WithTimeout(ctx, QueryTimeout)
+		defer cancel()
 		rows, err := q.ListProducts(ctx, store.ListProductsParams{
 			AfterID:  after,
 			RowLimit: in.Limit + 1, // one extra row says whether another page follows
@@ -103,7 +110,7 @@ func decodeCursor(c string) (int64, error) {
 	if c == "" {
 		return 0, nil
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(c)
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(c) // Strict: one string per cursor
 	if err != nil {
 		return 0, errCursor
 	}

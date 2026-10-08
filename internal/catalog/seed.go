@@ -8,7 +8,7 @@ import (
 )
 
 // seedProducts are the fixed development products. Prices are in cents.
-var seedProducts = []store.UpsertProductParams{
+var seedProducts = []store.InsertProductIfMissingParams{
 	{Slug: "canvas-tote", Name: "Canvas Tote", PriceAmount: 2400, PriceCurrency: "USD"},
 	{Slug: "ceramic-mug", Name: "Ceramic Mug", PriceAmount: 1800, PriceCurrency: "USD"},
 	{Slug: "linen-apron", Name: "Linen Apron", PriceAmount: 3600, PriceCurrency: "USD"},
@@ -17,15 +17,21 @@ var seedProducts = []store.UpsertProductParams{
 	{Slug: "beeswax-candle", Name: "Beeswax Candle", PriceAmount: 1500, PriceCurrency: "USD"},
 }
 
-// Upserter writes products; *store.Queries satisfies it.
-type Upserter interface {
-	UpsertProduct(ctx context.Context, arg store.UpsertProductParams) error
+// Seeder writes products; *store.Queries satisfies it.
+type Seeder interface {
+	UpdateProduct(ctx context.Context, arg store.UpdateProductParams) (int64, error)
+	InsertProductIfMissing(ctx context.Context, arg store.InsertProductIfMissingParams) error
 }
 
-// Seed upserts the development products by slug. Running it again changes nothing.
-func Seed(ctx context.Context, q Upserter) error {
+// Seed upserts the development products by slug. Running it again writes nothing and uses up no ids.
+func Seed(ctx context.Context, q Seeder) error {
 	for _, p := range seedProducts {
-		if err := q.UpsertProduct(ctx, p); err != nil {
+		if _, err := q.UpdateProduct(ctx, store.UpdateProductParams{
+			Name: p.Name, PriceAmount: p.PriceAmount, PriceCurrency: p.PriceCurrency, Slug: p.Slug,
+		}); err != nil {
+			return fmt.Errorf("seed %s: %w", p.Slug, err)
+		}
+		if err := q.InsertProductIfMissing(ctx, p); err != nil {
 			return fmt.Errorf("seed %s: %w", p.Slug, err)
 		}
 	}

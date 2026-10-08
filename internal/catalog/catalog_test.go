@@ -3,6 +3,7 @@ package catalog_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -95,6 +96,29 @@ func TestCatalog(t *testing.T) {
 		}
 	})
 
+	t.Run("reseeding uses up no ids, and restores a changed product", func(t *testing.T) {
+		lastValue := func() (v int64) {
+			if err := pool.QueryRow(ctx, `SELECT last_value FROM products_id_seq`).Scan(&v); err != nil {
+				t.Fatal(err)
+			}
+			return v
+		}
+		before := lastValue()
+		if _, err := pool.Exec(ctx, `UPDATE products SET price_amount = 1 WHERE slug = 'ceramic-mug'`); err != nil {
+			t.Fatal(err)
+		}
+		if err := catalog.Seed(ctx, store.New(pool)); err != nil {
+			t.Fatal(err)
+		}
+		if after := lastValue(); after != before {
+			t.Fatalf("the id sequence moved from %d to %d", before, after)
+		}
+		var amount int64
+		if err := pool.QueryRow(ctx, `SELECT price_amount FROM products WHERE slug = 'ceramic-mug'`).Scan(&amount); err != nil || amount != 1800 {
+			t.Fatalf("ceramic-mug price = %d, %v; want the seeded 1800", amount, err)
+		}
+	})
+
 	t.Run("constraints reject bad rows", func(t *testing.T) {
 		for name, q := range map[string]string{
 			"negative price":     `INSERT INTO products (slug, name, price_amount, price_currency) VALUES ('x-neg', 'X', -1, 'USD')`,
@@ -130,6 +154,38 @@ func TestCatalog(t *testing.T) {
 		}
 	})
 
+	t.Run("a limit that divides the total ends with a null cursor, not an empty page", func(t *testing.T) {
+		first := page(t, get(t, h, "/v1/products?limit=3"))
+		if len(first.Items) != 3 || first.NextCursor == nil {
+			t.Fatalf("first page: %d items, cursor %v", len(first.Items), first.NextCursor)
+		}
+		second := page(t, get(t, h, "/v1/products?limit=3&cursor="+*first.NextCursor))
+		if len(second.Items) != 3 || second.NextCursor != nil {
+			t.Fatalf("second page: %d items, cursor %v", len(second.Items), second.NextCursor)
+		}
+		all := page(t, get(t, h, "/v1/products?limit=6"))
+		if len(all.Items) != 6 || all.NextCursor != nil {
+			t.Fatalf("limit=6: %d items, cursor %v", len(all.Items), all.NextCursor)
+		}
+	})
+
+	t.Run("a cursor past the last product gives an empty page", func(t *testing.T) {
+		rec := get(t, h, "/v1/products?cursor=cDo5OTk5OTk") // "p:9999999"
+		p := page(t, rec)
+		if len(p.Items) != 0 || p.NextCursor != nil {
+			t.Fatalf("%d items, cursor %v", len(p.Items), p.NextCursor)
+		}
+		if !strings.Contains(rec.Body.String(), `"items":[]`) {
+			t.Fatalf("items must be an empty array, not null: %s", rec.Body)
+		}
+	})
+
+	t.Run("a valid cursor resumes after its id", func(t *testing.T) {
+		if p := page(t, get(t, h, "/v1/products?cursor=cDox")); len(p.Items) != 5 || p.Items[0].ID <= 1 { // "p:1"
+			t.Fatalf("%d items", len(p.Items))
+		}
+	})
+
 	t.Run("the default page holds everything, and the last page says so in JSON", func(t *testing.T) {
 		rec := get(t, h, "/v1/products")
 		if p := page(t, rec); len(p.Items) != 6 {
@@ -155,19 +211,13 @@ func TestCatalog(t *testing.T) {
 			"/v1/products?limit=101",
 			"/v1/products?limit=x",
 			"/v1/products?cursor=%25%25%25",
-			"/v1/products?cursor=" + "cDox", // base64url of "p:1" is cDox; truncated forms must fail
-			"/v1/products?cursor=eDox",      // "x:1": wrong prefix
-			"/v1/products?cursor=cDowMQ",    // "p:01": not canonical
-			"/v1/products?cursor=cDotMQ",    // "p:-1"
+			"/v1/products?cursor=eDox",   // "x:1": wrong prefix
+			"/v1/products?cursor=cDowMQ", // "p:01": not canonical
+			"/v1/products?cursor=cDotMQ", // "p:-1"
+			"/v1/products?cursor=cDoxMh", // "p:12" (cDoxMg) with non-zero padding bits
+			"/v1/products?cursor=cDo",    // truncated
 		} {
 			rec := get(t, h, target)
-			if target == "/v1/products?cursor=cDox" {
-				// "p:1" is a valid cursor: everything after id 1.
-				if p := page(t, rec); len(p.Items) != 5 {
-					t.Fatalf("valid cursor: %d items", len(p.Items))
-				}
-				continue
-			}
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("%s: status %d, want 400: %s", target, rec.Code, rec.Body)
 			}
@@ -180,6 +230,20 @@ func TestCatalog(t *testing.T) {
 					t.Fatalf("%s: body mentions %q: %s", target, leak, rec.Body)
 				}
 			}
+		}
+	})
+
+	// Last, because it adds rows: with more than 20 products, the default page holds exactly 20.
+	t.Run("limit defaults to 20", func(t *testing.T) {
+		for i := range 15 {
+			if _, err := pool.Exec(ctx, `INSERT INTO products (slug, name, price_amount, price_currency)
+				VALUES ($1, 'Extra', 100, 'USD')`, fmt.Sprintf("extra-%d", i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		p := page(t, get(t, h, "/v1/products"))
+		if len(p.Items) != 20 || p.NextCursor == nil {
+			t.Fatalf("default page: %d items, cursor %v; want 20 and a cursor", len(p.Items), p.NextCursor)
 		}
 	})
 }
