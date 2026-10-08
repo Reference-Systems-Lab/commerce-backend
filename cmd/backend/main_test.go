@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 )
@@ -82,5 +84,47 @@ func TestHealthcheck(t *testing.T) {
 	e, _ := testEnv(map[string]string{"PORT": port})
 	if code := run(context.Background(), []string{"healthcheck"}, e); code != exitFail {
 		t.Fatalf("closed port: exit %d, want %d", code, exitFail)
+	}
+}
+
+func TestOpenAPI(t *testing.T) {
+	e, stderr := testEnv(nil) // no database configuration at all
+	out := e.stdout.(*bytes.Buffer)
+	if code := run(context.Background(), []string{"openapi"}, e); code != exitOK {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	var doc struct {
+		OpenAPI string                    `json:"openapi"`
+		Paths   map[string]map[string]any `json:"paths"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.OpenAPI != "3.1.0" {
+		t.Fatalf("openapi = %q", doc.OpenAPI)
+	}
+	for _, p := range []string{"/health", "/v1/products"} {
+		if _, ok := doc.Paths[p]["get"]; !ok {
+			t.Fatalf("no GET %s in the document", p)
+		}
+	}
+	if bytes.Contains(out.Bytes(), []byte(`"422"`)) {
+		t.Fatal("the document lists 422, which the API never sends")
+	}
+}
+
+// The committed api/openapi.json must be exactly what the code generates (REQ-008). Run `make spec`
+// after changing a handler's types.
+func TestCommittedSpecIsCurrent(t *testing.T) {
+	want, err := openAPIDocument()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile("../../api/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("api/openapi.json is out of date: run `make spec` and commit the result")
 	}
 }

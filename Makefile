@@ -1,7 +1,7 @@
 # Developer entry points. CI runs the same targets. The tools run in pinned containers
 # (compose.tools.yaml); only Go itself is needed on the machine.
 .POSIX:
-.PHONY: help generate test
+.PHONY: help generate spec check-spec test
 
 TOOLS = UID=$$(id -u) GID=$$(id -g) docker compose -f compose.tools.yaml run --rm --quiet-pull
 
@@ -10,6 +10,12 @@ help: ## List the targets
 
 generate: ## Regenerate the sqlc query code
 	$(TOOLS) sqlc generate
+
+spec: ## Regenerate api/openapi.json from the code
+	go run ./cmd/backend openapi > api/openapi.json
+
+check-spec: ## Fail if api/openapi.json is stale or breaks the base branch (BASE_REF=origin/main)
+	sh ./scripts/check-spec.sh
 
 test: ## Unit and integration tests (needs Docker, for testcontainers)
 	go test -race ./...

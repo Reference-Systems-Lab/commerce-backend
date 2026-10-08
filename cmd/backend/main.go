@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +33,7 @@ commands:
   migrate      apply the pending database migrations
   seed         upsert the development data (idempotent)
   healthcheck  exit 0 if the API on 127.0.0.1:$PORT reports healthy, 1 otherwise
+  openapi      print the OpenAPI document (needs no database)
 `
 
 // Exit codes.
@@ -55,6 +57,7 @@ var commands = map[string]command{
 	"migrate":     migrateCmd,
 	"seed":        seed,
 	"healthcheck": healthcheck,
+	"openapi":     openapi,
 }
 
 func main() {
@@ -167,4 +170,24 @@ func healthcheck(ctx context.Context, e env) error {
 		return fmt.Errorf("the API reported %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// openapi prints the API's OpenAPI 3.1 document, the source of api/openapi.json and the SDK.
+func openapi(_ context.Context, e env) error {
+	doc, err := openAPIDocument()
+	if err != nil {
+		return err
+	}
+	_, err = e.stdout.Write(doc)
+	return err
+}
+
+func openAPIDocument() ([]byte, error) {
+	api, _ := httpserver.NewAPI()
+	app.Register(api, app.Deps{})
+	doc, err := json.MarshalIndent(api.OpenAPI(), "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(doc, '\n'), nil
 }

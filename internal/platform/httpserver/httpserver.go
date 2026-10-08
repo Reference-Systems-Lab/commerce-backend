@@ -46,9 +46,24 @@ func NewAPI() (huma.API, http.Handler) {
 	cfg.CreateHooks = nil
 	cfg.SchemasPath = ""
 	cfg.DocsPath = ""
+	cfg.OnAddOperation = append(cfg.OnAddOperation, documentBadRequest)
 	mux := http.NewServeMux()
 	api := humago.New(mux, cfg)
 	return api, Headers(mux)
+}
+
+// documentBadRequest keeps the document honest about the 422-to-400 mapping in init: an operation
+// that Huma says may answer 422 answers 400 instead.
+func documentBadRequest(_ *huma.OpenAPI, op *huma.Operation) {
+	r, ok := op.Responses["422"]
+	if !ok {
+		return
+	}
+	delete(op.Responses, "422")
+	if _, ok := op.Responses["400"]; !ok {
+		r.Description = http.StatusText(http.StatusBadRequest)
+		op.Responses["400"] = r
+	}
 }
 
 // Headers sets the headers every response carries. Caching is off because responses may show
