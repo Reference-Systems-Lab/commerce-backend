@@ -48,8 +48,9 @@ endpoint, the contract, the image, the fragment and the release. This record cov
 - **Sessions.** Separate customer and staff sessions with scs and our own RBAC: host-only
   `__Host-` cookies, `SameSite=Lax` for customers and `Strict` for staff, exact-origin CORS per
   audience, and an Origin or `Sec-Fetch-Site` check plus a custom header on unsafe methods (D6, D7;
-  commerce#3 DE-9). The WebSocket protocol (URL, authentication, event IDs, resync) is still open
-  and gets its own record.
+  commerce#3 DE-9).
+- **Real time.** coder/websocket serves the browser-safe events (D6). The protocol (URL,
+  authentication, event IDs, resync) is still open and gets its own record (D7).
 - **Observability.** The OpenTelemetry Go SDK with contrib instrumentation (D6), exporting to the
   platform's `observability` profile when it runs.
 - **Configuration and secrets.** Configuration comes from the environment. The database password
@@ -61,13 +62,18 @@ endpoint, the contract, the image, the fragment and the release. This record cov
   there is no shell.
 - **Running on the platform.** `compose.platform.yaml` declares `backend-migrate`, a one-shot that
   applies migrations, and `backend-api`. It sets no image, ports, networks or dependencies, names no
-  infrastructure host, and takes every value as a required variable; the platform's wiring file
+  infrastructure host, and takes every value the platform provides as a required variable (the
+  secret's path is fixed by Compose); the platform's wiring file
   pins the image digest and makes the API wait for the migration (commerce-platform#1 P-D2; D-5,
   D-6).
-- **Releases.** A GitHub release `vX.Y.Z`, published by hand, runs one workflow: the image goes to
-  `ghcr.io/reference-systems-lab/commerce-backend` with an SBOM, provenance and a build-provenance
-  attestation, after a Grype scan; `openapi.json` is attached to the release; the SDK is published
-  at the same version with an attested tarball (D-2). Only the publishing jobs hold write tokens.
+- **Releases.** A GitHub release `vX.Y.Z` on a commit on `main`, published by hand, runs one
+  workflow whose stages stop at the first failure: the SDK is built with no write access; the image
+  is scanned with Grype, then pushed to `ghcr.io/reference-systems-lab/commerce-backend` with an
+  SBOM, provenance and a build-provenance attestation; the SDK is published at the same version with
+  an attested tarball; `openapi.json` is attached to the release (D-2). Only the publishing jobs
+  hold write tokens, and a version already published is never pushed again. The first release,
+  v0.1.0, is cut by the walking skeleton itself, so the platform and storefront have something to
+  run (D-3).
 - **Checks.** golangci-lint v2 (with gosec and depguard), go-arch-lint, govulncheck, tests against
   a real Postgres through testcontainers-go, CodeQL for Go and Dependabot for Go modules, Docker,
   npm and actions, every action pinned by commit SHA (D6; commerce#3 DE-4).
