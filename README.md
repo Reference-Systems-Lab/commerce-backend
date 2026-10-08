@@ -98,14 +98,18 @@ repository read access), or a classic personal access token with `read:packages`
 
 ## Releasing
 
-Publish a GitHub release tagged `vX.Y.Z` (`gh release create vX.Y.Z --generate-notes`). The release
-workflow then:
+Publish a GitHub release tagged `vX.Y.Z` on a commit on `main` (`gh release create vX.Y.Z
+--generate-notes`). The release workflow then, stopping at the first failure:
 
-1. scans the image with Grype and stops on a critical finding;
-2. pushes `ghcr.io/reference-systems-lab/commerce-backend:X.Y.Z` for amd64 and arm64, with an SBOM
-   and a signed build-provenance attestation;
-3. attaches `openapi.json` to the release;
-4. publishes the SDK at `X.Y.Z`, with an attested tarball.
+1. checks the tag and that its commit is on `main`;
+2. builds and type-checks the SDK, with no write access;
+3. scans the image with Grype, stopping on a critical finding, then pushes
+   `ghcr.io/reference-systems-lab/commerce-backend:X.Y.Z` for amd64 and arm64 with an SBOM and a
+   signed build-provenance attestation;
+4. publishes the SDK at `X.Y.Z`, with an attested tarball;
+5. attaches `openapi.json` to the release.
+
+A rerun never republishes a version that is already on GHCR or GitHub Packages.
 
 The platform runs whatever digest its wiring file pins, so a release takes effect when the platform
 bumps that pin. Verify an artifact with `gh attestation verify --owner Reference-Systems-Lab`.

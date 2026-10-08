@@ -1,9 +1,15 @@
 name: Release
 
-# Publishing a GitHub release vX.Y.Z publishes everything at that version (ADR 0001, D-2): the image to
-# GHCR, openapi.json on the release, and the SDK to GitHub Packages. The image is scanned before it is
-# pushed, so a critical finding publishes nothing. Rerunning a release is safe: each step skips or
-# replaces what it already published.
+# Publishing a GitHub release vX.Y.Z publishes everything at that version (ADR 0001, D-2), one stage
+# after another, so a failure stops everything after it:
+#   1. version: the tag is vX.Y.Z and points at a commit on main;
+#   2. sdk-build: the SDK is generated, type-checked and packed, with no write access;
+#   3. image: scanned with Grype (amd64; arm64 is the same source and base), then pushed for amd64 and
+#      arm64 with an SBOM and provenance, then attested;
+#   4. sdk-publish: the packed SDK is attested and published to GitHub Packages;
+#   5. spec: openapi.json is attached to the release.
+# Rerunning a release is safe: a version already on GHCR or GitHub Packages is never pushed again, so
+# its digest and attestation stay as they were.
 on:
   release:
     types: [published]
@@ -17,6 +23,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/reference-systems-lab/commerce-backend
+  SDK: "@reference-systems-lab/commerce-api"
 
 jobs:
   version:
@@ -37,9 +44,62 @@ jobs:
           fi
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require the tagged commit to be on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::release tags must point at a commit on main; $GITHUB_SHA is not"
+            exit 1
+          fi
+
+  sdk-build:
+    name: SDK build
+    needs: version
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install, generate and check
+        run: |
+          npm ci --no-audit --no-fund
+          npm run generate
+          npm run check
+
+      - name: Set the version and pack
+        run: |
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm pack --silent
+
+      - name: Keep the tarball for publishing
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdk
+          path: sdk/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
   image:
     name: Image
-    needs: version
+    needs: [version, sdk-build]
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
@@ -47,8 +107,6 @@ jobs:
       packages: write # push to GHCR
       id-token: write # sign the attestation
       attestations: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -57,10 +115,27 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if this version is already published
+        id: existing
+        run: |
+          if digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}' 2>/dev/null); then
+            echo "$IMAGE:$VERSION is already published as $digest; not pushing it again"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Buildx
+        if: steps.existing.outputs.digest == ''
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build for scanning (amd64, not pushed)
+        if: steps.existing.outputs.digest == ''
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -69,6 +144,7 @@ jobs:
           tags: commerce-backend:scan
 
       - name: Scan with Grype (fails on a critical finding)
+        if: steps.existing.outputs.digest == ''
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: commerce-backend:scan
@@ -76,14 +152,8 @@ jobs:
           severity-cutoff: critical
           output-format: table
 
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Build and push amd64 and arm64, with an SBOM and provenance
+        if: steps.existing.outputs.digest == ''
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -96,6 +166,7 @@ jobs:
           labels: org.opencontainers.image.version=${{ env.VERSION }}
 
       - name: Attest the image's build provenance
+        if: steps.existing.outputs.digest == ''
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
@@ -104,12 +175,62 @@ jobs:
 
       - name: Summary
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
-        run: echo "Pushed \`$IMAGE:$VERSION@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+          DIGEST: ${{ steps.push.outputs.digest || steps.existing.outputs.digest }}
+        run: echo "Image \`$IMAGE:$VERSION@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+
+  sdk-publish:
+    name: SDK publish
+    needs: [version, image]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write # publish to GitHub Packages
+      id-token: write # sign the attestation
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Fetch the packed SDK
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sdk
+
+      - name: Set up Node for GitHub Packages
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: "@reference-systems-lab"
+
+      - name: Skip if this version is already published
+        id: existing
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if npm view "$SDK@$VERSION" version >/dev/null 2>&1; then
+            echo "$SDK@$VERSION is already published; not publishing it again"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+          tarball=$(ls ./*.tgz)
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the tarball's build provenance
+        if: steps.existing.outputs.published != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.existing.outputs.tarball }}
+
+      - name: Publish
+        if: steps.existing.outputs.published != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARBALL: ${{ steps.existing.outputs.tarball }}
+        run: npm publish "$TARBALL"
 
   spec:
     name: OpenAPI asset
-    needs: image
+    needs: sdk-publish
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
@@ -125,60 +246,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: gh release upload "$TAG" api/openapi.json --clobber --repo "$GITHUB_REPOSITORY"
-
-  sdk:
-    name: SDK
-    needs: [version, image]
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: write # publish to GitHub Packages
-      id-token: write # sign the attestation
-      attestations: write
-    env:
-      VERSION: ${{ needs.version.outputs.version }}
-    defaults:
-      run:
-        working-directory: sdk
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up Node for GitHub Packages
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          registry-url: https://npm.pkg.github.com
-          scope: "@reference-systems-lab"
-
-      - name: Install, generate and check
-        run: |
-          npm ci --no-audit --no-fund
-          npm run generate
-          npm run check
-
-      - name: Set the version and pack
-        id: pack
-        run: |
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
-          tarball=$(npm pack --silent)
-          echo "tarball=sdk/$tarball" >> "$GITHUB_OUTPUT"
-
-      - name: Attest the tarball's build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: ${{ steps.pack.outputs.tarball }}
-
-      - name: Publish, unless this version already is
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARBALL: ${{ steps.pack.outputs.tarball }}
-        run: |
-          if npm view "@reference-systems-lab/commerce-api@$VERSION" version >/dev/null 2>&1; then
-            echo "@reference-systems-lab/commerce-api@$VERSION is already published"
-            exit 0
-          fi
-          npm publish "../$TARBALL"
