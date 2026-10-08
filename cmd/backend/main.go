@@ -14,16 +14,23 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Reference-Systems-Lab/commerce-backend/internal/app"
+	"github.com/Reference-Systems-Lab/commerce-backend/internal/catalog"
+	"github.com/Reference-Systems-Lab/commerce-backend/internal/catalog/store"
 	"github.com/Reference-Systems-Lab/commerce-backend/internal/platform/config"
 	"github.com/Reference-Systems-Lab/commerce-backend/internal/platform/db"
 	"github.com/Reference-Systems-Lab/commerce-backend/internal/platform/httpserver"
+	"github.com/Reference-Systems-Lab/commerce-backend/internal/platform/migrate"
 )
 
 const usage = `usage: backend <command>
 
 commands:
   serve        run the HTTP API
+  migrate      apply the pending database migrations
+  seed         upsert the development data (idempotent)
   healthcheck  exit 0 if the API on 127.0.0.1:$PORT reports healthy, 1 otherwise
 `
 
@@ -45,6 +52,8 @@ type command func(ctx context.Context, e env) error
 
 var commands = map[string]command{
 	"serve":       serve,
+	"migrate":     migrateCmd,
+	"seed":        seed,
 	"healthcheck": healthcheck,
 }
 
@@ -76,16 +85,48 @@ func logger(w io.Writer) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(w, nil))
 }
 
+// openDB loads the database configuration and opens the pool.
+func openDB(ctx context.Context, e env) (*pgxpool.Pool, error) {
+	dbCfg, err := config.LoadDatabase(e.lookup, e.readFile)
+	if err != nil {
+		return nil, err
+	}
+	return db.Open(ctx, dbCfg)
+}
+
+func migrateCmd(ctx context.Context, e env) error {
+	pool, err := openDB(ctx, e)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	n, err := migrate.Up(ctx, pool)
+	if err != nil {
+		return err
+	}
+	logger(e.stdout).Info("migrated", "applied", n)
+	return nil
+}
+
+func seed(ctx context.Context, e env) error {
+	pool, err := openDB(ctx, e)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := catalog.Seed(ctx, store.New(pool)); err != nil {
+		return err
+	}
+	logger(e.stdout).Info("seeded")
+	return nil
+}
+
 func serve(ctx context.Context, e env) error {
 	srvCfg, err := config.LoadServer(e.lookup)
 	if err != nil {
 		return err
 	}
-	dbCfg, err := config.LoadDatabase(e.lookup, e.readFile)
-	if err != nil {
-		return err
-	}
-	pool, err := db.Open(ctx, dbCfg)
+	pool, err := openDB(ctx, e)
 	if err != nil {
 		return err
 	}

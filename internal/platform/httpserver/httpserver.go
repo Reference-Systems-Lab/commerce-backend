@@ -24,6 +24,18 @@ const (
 // ShutdownTimeout bounds how long in-flight requests may run after SIGTERM.
 const ShutdownTimeout = 10 * time.Second
 
+func init() {
+	// Huma answers 422 when a parameter fails validation. The API contract says 400 for any request
+	// the client got wrong, so map it once here, before any API exists.
+	base := huma.NewError
+	huma.NewError = func(status int, msg string, errs ...error) huma.StatusError {
+		if status == http.StatusUnprocessableEntity {
+			status = http.StatusBadRequest
+		}
+		return base(status, msg, errs...)
+	}
+}
+
 // NewAPI returns a Huma API on a standard mux, plus the handler that serves it with the headers every
 // response carries. It serves its OpenAPI document at /openapi.json and no docs page, which would
 // load scripts from a CDN.
