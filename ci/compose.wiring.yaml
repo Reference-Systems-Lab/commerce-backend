@@ -1,0 +1,15 @@
+# Stands in for the platform's compose/compose.backend.yaml: the image (here a local build instead of a
+# digest), the order, and the one port CI curls.
+services:
+  backend-migrate:
+    image: commerce-backend:ci
+    pull_policy: never
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  backend-api:
+    image: commerce-backend:ci
+    pull_policy: never
+    depends_on:
+      backend-migrate: { condition: service_completed_successfully }
+    ports: ["127.0.0.1:18080:8080"]
