@@ -1,0 +1,184 @@
+name: Release
+
+# Publishing a GitHub release vX.Y.Z publishes everything at that version (ADR 0001, D-2): the image to
+# GHCR, openapi.json on the release, and the SDK to GitHub Packages. The image is scanned before it is
+# pushed, so a critical finding publishes nothing. Rerunning a release is safe: each step skips or
+# replaces what it already published.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/reference-systems-lab/commerce-backend
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Read the version from the tag
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release tag '$TAG' is not vX.Y.Z"
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: Image
+    needs: version
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # sign the attestation
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build for scanning (amd64, not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: commerce-backend:scan
+
+      - name: Scan with Grype (fails on a critical finding)
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: commerce-backend:scan
+          fail-build: true
+          severity-cutoff: critical
+          output-format: table
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push amd64 and arm64, with an SBOM and provenance
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
+          labels: org.opencontainers.image.version=${{ env.VERSION }}
+
+      - name: Attest the image's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "Pushed \`$IMAGE:$VERSION@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+
+  spec:
+    name: OpenAPI asset
+    needs: image
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # upload the release asset
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Attach openapi.json to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" api/openapi.json --clobber --repo "$GITHUB_REPOSITORY"
+
+  sdk:
+    name: SDK
+    needs: [version, image]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write # publish to GitHub Packages
+      id-token: write # sign the attestation
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node for GitHub Packages
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: "@reference-systems-lab"
+
+      - name: Install, generate and check
+        run: |
+          npm ci --no-audit --no-fund
+          npm run generate
+          npm run check
+
+      - name: Set the version and pack
+        id: pack
+        run: |
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          tarball=$(npm pack --silent)
+          echo "tarball=sdk/$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the tarball's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.pack.outputs.tarball }}
+
+      - name: Publish, unless this version already is
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          if npm view "@reference-systems-lab/commerce-api@$VERSION" version >/dev/null 2>&1; then
+            echo "@reference-systems-lab/commerce-api@$VERSION is already published"
+            exit 0
+          fi
+          npm publish "../$TARBALL"
