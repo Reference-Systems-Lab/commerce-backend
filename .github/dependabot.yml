@@ -51,3 +51,15 @@ updates:
       # Follow the platform's Postgres major, never ahead of it.
       - dependency-name: postgres
         update-types: ["version-update:semver-major"]
+
+  # The SDK package (sdk/).
+  - package-ecosystem: npm
+    directory: /sdk
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      sdk:
+        patterns: ["*"]
+        update-types: [minor, patch]

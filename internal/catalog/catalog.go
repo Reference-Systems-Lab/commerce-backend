@@ -30,7 +30,7 @@ type Product struct {
 
 // ProductPage is one page of products in id order.
 type ProductPage struct {
-	Items      []Product `json:"items"`
+	Items      []Product `json:"items" nullable:"false"`
 	NextCursor *string   `json:"next_cursor" required:"true" nullable:"true" doc:"Pass as cursor for the next page; null on the last page"`
 }
 

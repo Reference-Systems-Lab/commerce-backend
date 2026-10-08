@@ -128,10 +128,7 @@
             "items": {
               "$ref": "#/components/schemas/Product"
             },
-            "type": [
-              "array",
-              "null"
-            ]
+            "type": "array"
           },
           "next_cursor": {
             "description": "Pass as cursor for the next page; null on the last page",

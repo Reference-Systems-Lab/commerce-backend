@@ -1,7 +1,7 @@
 # Developer entry points. CI runs the same targets. The tools run in pinned containers
 # (compose.tools.yaml); only Go itself is needed on the machine.
 .POSIX:
-.PHONY: help generate spec check-spec lint test image fragment
+.PHONY: help generate spec check-spec lint test image fragment sdk
 
 TOOLS = HOST_UID=$$(id -u) HOST_GID=$$(id -g) docker compose -f compose.tools.yaml run --rm --quiet-pull
 
@@ -28,3 +28,6 @@ image: ## Build the image for this machine as commerce-backend:ci
 
 fragment: image ## Run compose.platform.yaml the way the platform does, and check it
 	IMAGE=commerce-backend:ci sh ./scripts/fragment-smoke.sh
+
+sdk: ## Generate the SDK's types from api/openapi.json and type-check its sample
+	cd sdk && npm ci --no-audit --no-fund && npm run generate && npm run check
