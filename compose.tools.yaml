@@ -42,7 +42,7 @@ services:
       HOME: /tmp
     volumes: &gomod
       - { type: bind, source: ., target: /src, read_only: true, bind: { create_host_path: false } }
-      - { type: bind, source: "${GOMODCACHE:?}", target: /go/pkg/mod, read_only: true, bind: { create_host_path: false } }
+      - { type: bind, source: "${GOMODCACHE:-/nonexistent-run-make-lint}", target: /go/pkg/mod, read_only: true, bind: { create_host_path: false } }
 
   go-arch-lint:
     <<: *tool

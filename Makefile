@@ -12,7 +12,7 @@ generate: ## Regenerate the sqlc query code
 	$(TOOLS) sqlc generate
 
 spec: ## Regenerate api/openapi.json from the code
-	go run ./cmd/backend openapi > api/openapi.json
+	go run ./cmd/backend openapi > api/openapi.json.tmp && mv api/openapi.json.tmp api/openapi.json
 
 check-spec: ## Fail if api/openapi.json is stale or breaks the base branch (BASE_REF=origin/main)
 	sh ./scripts/check-spec.sh
@@ -27,7 +27,7 @@ image: ## Build the image for this machine as commerce-backend:ci
 	docker build -t commerce-backend:ci .
 
 fragment: image ## Run compose.platform.yaml the way the platform does, and check it
-	IMAGE=commerce-backend:ci sh ./scripts/fragment-smoke.sh
+	SKIP_BUILD=1 sh ./scripts/fragment-smoke.sh
 
 sdk: ## Generate the SDK's types from api/openapi.json and type-check its sample
 	cd sdk && npm ci --no-audit --no-fund && npm run generate && npm run check

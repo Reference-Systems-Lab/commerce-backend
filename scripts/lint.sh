@@ -31,8 +31,26 @@ echo "lint: actionlint"
 tool actionlint
 
 echo "lint: every action is pinned to a commit SHA with its version"
-if grep -rnE '^\s*-?\s*uses:' .github/workflows | grep -vE 'uses: [^@ ]+@[0-9a-f]{40} # v[0-9]+(\.[0-9]+)*$'; then
+if grep -rnE '^[[:space:]]*-?[[:space:]]*uses:' .github/workflows | grep -vE 'uses: [^@ ]+@[0-9a-f]{40} # v[0-9]+(\.[0-9]+)*$'; then
 	echo "error: the uses: lines above aren't pinned as <action>@<40-hex sha> # vX.Y.Z" >&2
+	exit 1
+fi
+
+echo "lint: every image is pinned by digest"
+if grep -nE '^[[:space:]]*image:' compose.tools.yaml ci/*.yaml | grep -v '@sha256:[0-9a-f]\{64\}' | grep -v 'commerce-backend:ci'; then
+	echo "error: the images above aren't pinned as <name>:<tag>@sha256:<digest>" >&2
+	exit 1
+fi
+if grep -nE '^FROM ' Dockerfile | grep -v '@sha256:[0-9a-f]\{64\}'; then
+	echo "error: the Dockerfile's FROM lines above aren't pinned by digest" >&2
+	exit 1
+fi
+
+echo "lint: the tests' Postgres matches the stand-in platform's (Dependabot bumps only the YAML)"
+stub=$(sed -n 's/^[[:space:]]*image:[[:space:]]*\(postgres:[^[:space:]]*\).*/\1/p' ci/compose.stub.yaml)
+tests=$(sed -n 's/^const Image = "\(postgres:[^"]*\)"/\1/p' internal/platform/dbtest/dbtest.go)
+if [ -z "$stub" ] || [ "$stub" != "$tests" ]; then
+	echo "error: ci/compose.stub.yaml has '$stub' but internal/platform/dbtest/dbtest.go has '$tests'" >&2
 	exit 1
 fi
 

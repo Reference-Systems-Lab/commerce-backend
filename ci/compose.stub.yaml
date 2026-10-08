@@ -19,6 +19,7 @@ services:
       POSTGRES_DB: commerce
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     secrets: [postgres_password]
+    networks: [data]
     tmpfs: ["/tmp:size=64m", "/var/run/postgresql:uid=999,gid=999,size=1m", "/var/lib/postgresql:uid=999,gid=999"]
     healthcheck:
       test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "commerce", "-d", "commerce"]
@@ -27,6 +28,13 @@ services:
       retries: 5
       start_period: 60s
       start_interval: 1s
+
+# The platform's networks (its D-13): `data` is internal, so only a container also on `edge` can be
+# reached from outside.
+networks:
+  edge: {}
+  data:
+    internal: true
 
 secrets:
   postgres_password:

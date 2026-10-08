@@ -2,7 +2,7 @@
 # Runs compose.platform.yaml the way the platform does (ci/compose.stub.yaml) and checks it (REQ-011):
 # migrate completes, the API turns healthy, seeding works, the catalog answers, and every backend
 # container is hardened and publishes nothing of its own. Always removes the stack.
-#   IMAGE  the image to test (default: build commerce-backend:ci from this checkout)
+#   SKIP_BUILD=1  test the commerce-backend:ci image already built (make fragment builds it first)
 set -eu
 
 dir=$(mktemp -d)
@@ -24,7 +24,7 @@ trap cleanup EXIT INT TERM
 od -An -N16 -tx1 /dev/urandom | tr -d ' \n' >"$dir/postgres_password"
 chmod 0644 "$dir/postgres_password"
 
-if [ -z "${IMAGE:-}" ]; then
+if [ "${SKIP_BUILD:-}" != 1 ]; then
 	docker build -q -t commerce-backend:ci . >/dev/null
 fi
 
@@ -51,8 +51,13 @@ for svc in backend-migrate backend-api; do
 	[ "$got" = "$want" ] || { echo "error: $svc: $got" >&2; exit 1; }
 done
 # The fragment publishes nothing; only the stub's wiring file publishes the port CI curls.
-if grep -nE '^\s*(image|ports|networks|depends_on):' compose.platform.yaml; then
-	echo "error: compose.platform.yaml must not set image, ports, networks or depends_on" >&2
+if grep -nE '^[[:space:]]*(image|ports|networks|depends_on|build):' compose.platform.yaml; then
+	echo "error: compose.platform.yaml must not set image, ports, networks, depends_on or build" >&2
+	exit 1
+fi
+# Nor name an infrastructure host: those come from the platform through required variables.
+if grep -nE '(postgres|valkey|rabbitmq|meilisearch|mailpit)[:/@]' compose.platform.yaml; then
+	echo "error: compose.platform.yaml names an infrastructure host" >&2
 	exit 1
 fi
 

@@ -48,6 +48,8 @@ updates:
         patterns: ["*"]
         update-types: [minor, patch]
     ignore:
+      # The stand-in platform's locally built image; nothing to update.
+      - dependency-name: commerce-backend
       # Follow the platform's Postgres major, never ahead of it.
       - dependency-name: postgres
         update-types: ["version-update:semver-major"]
