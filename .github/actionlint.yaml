@@ -1,0 +1,3 @@
+# actionlint 1.7.12 predates GitHub's ubuntu-26.04 runner label, which every workflow here uses.
+self-hosted-runner:
+  labels: [ubuntu-26.04]

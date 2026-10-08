@@ -35,7 +35,7 @@ type ProductPage struct {
 }
 
 type listInput struct {
-	Limit  int    `query:"limit" minimum:"1" maximum:"100" default:"20" doc:"Products per page"`
+	Limit  int32  `query:"limit" minimum:"1" maximum:"100" default:"20" doc:"Products per page"`
 	Cursor string `query:"cursor" maxLength:"64" doc:"next_cursor from the previous page; omit for the first page"`
 }
 
@@ -65,14 +65,15 @@ func Register(api huma.API, q Lister) {
 		}
 		rows, err := q.ListProducts(ctx, store.ListProductsParams{
 			AfterID:  after,
-			RowLimit: int32(in.Limit) + 1, // one extra row says whether another page follows
+			RowLimit: in.Limit + 1, // one extra row says whether another page follows
 		})
 		if err != nil {
 			return nil, err // Huma answers 500 without the error's text
 		}
-		page := ProductPage{Items: make([]Product, 0, min(len(rows), in.Limit))}
+		limit := int(in.Limit)
+		page := ProductPage{Items: make([]Product, 0, min(len(rows), limit))}
 		for i, r := range rows {
-			if i == in.Limit {
+			if i == limit {
 				next := encodeCursor(page.Items[i-1].ID)
 				page.NextCursor = &next
 				break

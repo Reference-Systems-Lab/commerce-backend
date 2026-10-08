@@ -1,8 +1,53 @@
 version: 2
 
+# Every ecosystem waits 7 days after a release before proposing it, and groups its routine updates
+# into one pull request. Images are pinned by tag and digest; Dependabot updates both.
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-  # Add this repository's package ecosystem as its code lands
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      go-modules:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # The Dockerfile's golang and distroless bases.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      base-images:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # compose.tools.yaml (the development tools) and ci/compose.stub.yaml (the stand-in platform).
+  - package-ecosystem: docker-compose
+    directories: ["/", "/ci"]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      tool-images:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # Follow the platform's Postgres major, never ahead of it.
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]

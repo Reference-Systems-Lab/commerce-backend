@@ -94,7 +94,8 @@ func TestRunDrainsOnCancel(t *testing.T) {
 	if time.Since(begin) > ShutdownTimeout {
 		t.Fatal("draining took longer than the shutdown timeout")
 	}
-	if _, err := http.Get("http://" + ln.Addr().String() + "/"); err == nil {
+	if resp, err := http.Get("http://" + ln.Addr().String() + "/"); err == nil {
+		resp.Body.Close()
 		t.Fatal("the server still accepts connections after shutdown")
 	}
 }

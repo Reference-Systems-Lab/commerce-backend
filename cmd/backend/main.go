@@ -138,7 +138,7 @@ func serve(ctx context.Context, e env) error {
 	api, handler := httpserver.NewAPI()
 	app.Register(api, app.Deps{DB: pool})
 	srv := httpserver.New(handler, srvCfg.Port)
-	ln, err := net.Listen("tcp", srv.Addr)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", srv.Addr)
 	if err != nil {
 		return err
 	}

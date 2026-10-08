@@ -1,9 +1,9 @@
 # Developer entry points. CI runs the same targets. The tools run in pinned containers
 # (compose.tools.yaml); only Go itself is needed on the machine.
 .POSIX:
-.PHONY: help generate spec check-spec test image fragment
+.PHONY: help generate spec check-spec lint test image fragment
 
-TOOLS = UID=$$(id -u) GID=$$(id -g) docker compose -f compose.tools.yaml run --rm --quiet-pull
+TOOLS = HOST_UID=$$(id -u) HOST_GID=$$(id -g) docker compose -f compose.tools.yaml run --rm --quiet-pull
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' Makefile | sed 's/:.*## /\t/'
@@ -16,6 +16,9 @@ spec: ## Regenerate api/openapi.json from the code
 
 check-spec: ## Fail if api/openapi.json is stale or breaks the base branch (BASE_REF=origin/main)
 	sh ./scripts/check-spec.sh
+
+lint: ## Every static check CI runs: Go lint and boundaries, sqlc, Dockerfile, workflows, pins, spec
+	sh ./scripts/lint.sh
 
 test: ## Unit and integration tests (needs Docker, for testcontainers)
 	go test -race ./...

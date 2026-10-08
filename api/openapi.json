@@ -218,7 +218,7 @@
             "schema": {
               "default": 20,
               "description": "Products per page",
-              "format": "int64",
+              "format": "int32",
               "maximum": 100,
               "minimum": 1,
               "type": "integer"

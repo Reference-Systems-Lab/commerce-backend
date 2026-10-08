@@ -9,7 +9,7 @@ x-tool: &tool
   security_opt: ["no-new-privileges:true"]
   init: true
   network_mode: none
-  user: "${UID:-1000}:${GID:-1000}"
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
   working_dir: /src
   tmpfs: ["/tmp:size=256m"]
   volumes:
@@ -27,3 +27,35 @@ services:
   oasdiff:
     <<: *tool
     image: tufin/oasdiff:v1.33.0@sha256:6263a96dd2ef0726c54e21fea9b8e1607eac4841add0079324b424c1f52b819c
+
+  # The Go analysers read the module cache read-only (make lint downloads it first) and never fetch.
+  golangci-lint:
+    <<: *tool
+    image: golangci/golangci-lint:v2.14.0@sha256:ad862ba6b3798cbe0fd9fd7408d498fd74fbd2623a92406b2fd3898faf0bf98f
+    tmpfs: &gotmp ["/tmp:size=2g"] # the Go build cache while analysing
+    environment: &goenv
+      GOFLAGS: -mod=readonly
+      GOPROXY: "off"
+      GOTOOLCHAIN: local
+      GOCACHE: /tmp/go-cache
+      GOLANGCI_LINT_CACHE: /tmp/lint-cache
+      HOME: /tmp
+    volumes: &gomod
+      - { type: bind, source: ., target: /src, read_only: true, bind: { create_host_path: false } }
+      - { type: bind, source: "${GOMODCACHE:?}", target: /go/pkg/mod, read_only: true, bind: { create_host_path: false } }
+
+  go-arch-lint:
+    <<: *tool
+    image: fe3dback/go-arch-lint:release-v1.19.0@sha256:9f4fb1216095becb37d889cc471ee8d93f7b5e5d531bde83571415013eca3fa1
+    tmpfs: *gotmp
+    environment: *goenv
+    volumes: *gomod
+
+  hadolint:
+    <<: *tool
+    image: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+    entrypoint: ["/bin/hadolint"]
+
+  actionlint:
+    <<: *tool
+    image: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667

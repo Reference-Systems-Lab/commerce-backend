@@ -20,6 +20,6 @@ fi
 chmod 0755 "$tmp" && chmod 0644 "$tmp/base.json"
 
 echo "spec: no breaking change against $base_ref"
-UID=$(id -u) GID=$(id -g) docker compose -f compose.tools.yaml run --rm --quiet-pull \
+HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose -f compose.tools.yaml run --rm --quiet-pull \
 	-v "$tmp/base.json:/base/openapi.json:ro" \
 	oasdiff breaking /base/openapi.json api/openapi.json --fail-on ERR

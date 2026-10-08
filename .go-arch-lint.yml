@@ -1,0 +1,28 @@
+# Which package may import which (ADR 0001: domains stay bounded). A domain depends only on the shared
+# platform packages; only app and the command know every domain.
+version: 3
+workdir: .
+allow:
+  depOnAnyVendor: true
+
+components:
+  cmd:        { in: cmd/** }
+  app:        { in: internal/app }
+  health:     { in: internal/health }
+  catalog:    { in: internal/catalog/** }
+  platform:   { in: internal/platform/** }
+  migrations: { in: migrations }
+
+# Each component lists itself: the tool treats a component's own subpackages (and external test
+# packages) as imports to check.
+deps:
+  cmd:
+    mayDependOn: [cmd, app, catalog, platform]
+  app:
+    mayDependOn: [app, health, catalog, platform]
+  health:
+    mayDependOn: [health, platform]
+  catalog:
+    mayDependOn: [catalog, platform]
+  platform:
+    mayDependOn: [platform, migrations]
