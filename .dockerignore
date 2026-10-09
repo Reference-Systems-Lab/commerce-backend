@@ -1,0 +1,8 @@
+# Only what the build needs reaches the build context.
+*
+!go.mod
+!go.sum
+!cmd
+!internal
+!migrations
+**/*_test.go

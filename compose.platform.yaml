@@ -1,0 +1,38 @@
+# The backend's contract with the platform (commerce-platform#1 P-D2; ADR 0001). The platform includes
+# this file together with its own wiring file, which sets the image digest, the networks and the order
+# (backend-api waits for backend-migrate to complete). So this file sets no image, ports, networks or
+# depends_on, and names no infrastructure host: every value it needs is a required variable, and the
+# database password arrives only as the platform's `postgres_password` secret.
+
+x-backend: &backend
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  init: true
+  user: "65532:65532"
+  tmpfs: ["/tmp:size=16m"]
+  environment:
+    DATABASE_URL: ${BACKEND_DATABASE_URL:?the platform sets it, without a password}
+    DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+  secrets: [postgres_password]
+
+services:
+  # Applies pending migrations, then exits. Safe to run on every `up`.
+  backend-migrate:
+    <<: *backend
+    command: ["migrate"]
+    restart: "no"
+    healthcheck:
+      disable: true # a one-shot; the image's health check is for the API
+
+  backend-api:
+    <<: *backend
+    command: ["serve"]
+    stop_grace_period: 15s # the API drains for up to 10 s on SIGTERM
+    healthcheck:
+      test: ["CMD", "/backend", "healthcheck"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
+      start_interval: 1s
