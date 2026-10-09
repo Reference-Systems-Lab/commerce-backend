@@ -65,3 +65,8 @@ updates:
       sdk:
         patterns: ["*"]
         update-types: [minor, patch]
+    ignore:
+      # TypeScript stays on 6.0 (commerce#3 DE-3): TypeScript 7 ships no compiler API, which
+      # openapi-typescript needs to generate the SDK. Lift this when openapi-typescript supports 7.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
