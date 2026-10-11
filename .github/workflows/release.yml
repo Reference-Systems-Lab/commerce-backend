@@ -122,17 +122,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Fails closed: only "not found" (or a package with no versions yet) lets the build go on, so a
+      # registry error on a rerun can never push the version again and move its tag.
       - name: Skip if this version is already published
         id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}' 2>/dev/null); then
-            echo "$IMAGE:$VERSION is already published as $digest; not pushing it again"
-            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          if out=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}' 2>&1); then
+            echo "$IMAGE:$VERSION is already published as $out; not pushing it again"
+            echo "digest=$out" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$out" | grep -qiE 'not found|manifest unknown|name unknown'; then
+            echo "$IMAGE:$VERSION is not published yet"
+          elif gh api "/orgs/Reference-Systems-Lab/packages/container/commerce-backend" 2>&1 | grep -q 'HTTP 404'; then
+            echo "$IMAGE has no versions yet; this is its first publication"
+          else
+            echo "::error::cannot tell whether $IMAGE:$VERSION exists: $out"
+            exit 1
           fi
 
+      # The builder that receives the job's token and writes the SBOM and provenance, pinned by digest.
+      # Dependabot can't see an image in `with:`, so it's bumped by hand (README).
       - name: Set up Buildx
         if: steps.existing.outputs.digest == ''
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build for scanning (amd64, not pushed)
         if: steps.existing.outputs.digest == ''
@@ -208,9 +223,15 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if npm view "$SDK@$VERSION" version >/dev/null 2>&1; then
+          # Fails closed like the image's check: only npm's E404 means "not published".
+          if npm view "$SDK@$VERSION" version >/dev/null 2>"$RUNNER_TEMP/npm-view.err"; then
             echo "$SDK@$VERSION is already published; not publishing it again"
             echo "published=true" >> "$GITHUB_OUTPUT"
+          elif grep -q E404 "$RUNNER_TEMP/npm-view.err"; then
+            echo "$SDK@$VERSION is not published yet"
+          else
+            echo "::error::cannot tell whether $SDK@$VERSION exists: $(cat "$RUNNER_TEMP/npm-view.err")"
+            exit 1
           fi
           tarball=$(ls ./*.tgz)
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
