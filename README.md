@@ -109,7 +109,12 @@ Publish a GitHub release tagged `vX.Y.Z` on a commit on `main` (`gh release crea
 4. publishes the SDK at `X.Y.Z`, with an attested tarball;
 5. attaches `openapi.json` to the release.
 
-A rerun never republishes a version that is already on GHCR or GitHub Packages.
+A rerun never republishes a version that is already on GHCR or GitHub Packages. Both checks fail
+closed: only "not found" lets a release go on, so a registry error can never push a version twice
+and move its tag.
+
+The release's BuildKit builder is pinned by digest in `release.yml` (`driver-opts`). Dependabot
+can't see an image in a `with:` input, so it's bumped by hand.
 
 The platform runs whatever digest its wiring file pins, so a release takes effect when the platform
 bumps that pin. Verify an artifact with `gh attestation verify --owner Reference-Systems-Lab`.
