@@ -22,7 +22,7 @@
   ],
   "sideEffects": false,
   "engines": {
-    "node": ">=24"
+    "node": ">=26"
   },
   "scripts": {
     "generate": "openapi-typescript ../api/openapi.json --output schema.d.ts",
