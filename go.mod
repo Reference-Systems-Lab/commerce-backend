@@ -2,7 +2,7 @@ module github.com/Reference-Systems-Lab/commerce-backend
 
 go 1.27.0
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
 	github.com/danielgtaylor/huma/v2 v2.39.1
