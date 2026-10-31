@@ -103,7 +103,7 @@ Publish a GitHub release tagged `vX.Y.Z` on a commit on `main` (`gh release crea
 
 1. checks the tag and that its commit is on `main`;
 2. builds and type-checks the SDK, with no write access;
-3. scans the image with Grype, stopping on a critical finding, then pushes
+3. scans the image with Grype, stopping on a high or critical finding, then pushes
    `ghcr.io/reference-systems-lab/commerce-backend:X.Y.Z` for amd64 and arm64 with an SBOM and a
    signed build-provenance attestation;
 4. publishes the SDK at `X.Y.Z`, with an attested tarball;
