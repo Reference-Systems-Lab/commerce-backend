@@ -158,13 +158,13 @@ jobs:
           load: true
           tags: commerce-backend:scan
 
-      - name: Scan with Grype (fails on a critical finding)
+      - name: Scan with Grype (fails on a high or critical finding)
         if: steps.existing.outputs.digest == ''
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: commerce-backend:scan
           fail-build: true
-          severity-cutoff: critical
+          severity-cutoff: high
           output-format: table
 
       - name: Build and push amd64 and arm64, with an SBOM and provenance
