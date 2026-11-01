@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "41 5 * * 1" # Weekly, so a new advisory fails the scans even when nothing changes
 
 permissions:
   contents: read
@@ -56,7 +58,7 @@ jobs:
   vuln:
     name: Vulnerabilities
     runs-on: ubuntu-26.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -70,6 +72,34 @@ jobs:
 
       - name: govulncheck
         run: go tool govulncheck ./...
+
+      - name: Build the image for the scan
+        run: docker build -t commerce-backend:scan .
+
+      - name: Grype on the image at high, with no allowlist
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: commerce-backend:scan
+          fail-build: true
+          severity-cutoff: high
+          output-format: table
+
+      - name: Set up Node, for the SDK's install
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+
+      - name: Install the SDK's packages
+        working-directory: sdk
+        run: npm ci --no-audit --no-fund
+
+      - name: Grype on every package the SDK installs, at high, with no allowlist
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          path: sdk
+          fail-build: true
+          severity-cutoff: high
+          output-format: table
 
   fragment:
     name: Fragment
