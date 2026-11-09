@@ -26,7 +26,7 @@ services:
   # Compares the spec with the base branch's copy, which scripts/check-spec.sh mounts at /base.
   oasdiff:
     <<: *tool
-    image: tufin/oasdiff:v1.34.0@sha256:dd742562c1f3146f6e2a80bc01951cc87d15a249ac2aca05665339e30cf03620
+    image: tufin/oasdiff:v1.35.0@sha256:82b1840a77335562bb11ce95f77ad31745a0c6f3a770929333ed1c5ef466e400
 
   # The Go analysers read the module cache read-only (make lint downloads it first) and never fetch.
   golangci-lint:
@@ -46,7 +46,7 @@ services:
 
   go-arch-lint:
     <<: *tool
-    image: fe3dback/go-arch-lint:release-v1.19.0@sha256:9f4fb1216095becb37d889cc471ee8d93f7b5e5d531bde83571415013eca3fa1
+    image: fe3dback/go-arch-lint:release-v1.19.1@sha256:77745ca3093a10f8030ff6899fe41b1d6df394c08c249ae90579170003c66b18
     tmpfs: *gotmp
     environment: *goenv
     volumes: *gomod
