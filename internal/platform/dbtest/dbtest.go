@@ -14,7 +14,7 @@ import (
 
 // Image is the platform's Postgres pin (commerce-platform compose.yaml). Dependabot doesn't watch Go
 // string constants, so bump it when the platform bumps its pin.
-const Image = "postgres:18.6-trixie@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336"
+const Image = "postgres:18.7-trixie@sha256:9f4fd4aa918f52ae3d6f3b687f1de90d8f867cd4d520021545a9a50c120eae3b"
 
 // Password is the test database's throwaway password.
 const Password = "test-only-password"
