@@ -61,7 +61,7 @@ the decisions that shape it.
   | `platform` | `idempotency_keys`, `outbox_messages`, `inbox_messages`, `audit_events` |
 
   Foreign keys may cross domains, since there is one database. Go imports may not. Three workflow components
-  coordinate several domains in one database transaction: `checkout`, `billing` (renewals, retries, notices and
+  coordinate several domains in one database transaction: `checkout` (checkouts, and returns and refunds), `billing` (renewals, retries, notices and
   abandonment) and `reconcile`. go-arch-lint lets each depend only on the domains it coordinates, and lets no
   domain depend on a workflow.
 - **Money** is a `bigint` count of cents. Each document that owns amounts (a price, an order, a transaction, a
