@@ -198,7 +198,8 @@ buyer, whether or not they have an account.
 - There is no draft order. The cart and price preview are computed without writing rows, and an order exists only
   once checkout places it, with every amount frozen.
 - An order whose total is zero, for example after a 100% discount, is `paid` when it is placed, with no
-  transaction.
+  transaction. The exception is an order with a subscription line: it becomes `paid` once its card-saving
+  authorization is approved (see Workflows → Checkout), because the subscription needs a saved card.
 
 ```mermaid
 stateDiagram-v2
@@ -288,7 +289,8 @@ Refunds and chargebacks never change `status`. They are reported beside it (see 
 | quantity | int | `>= 1`; across returns not rejected or cancelled, never more than was shipped |
 
 A physical line is refunded after its return is received. Staff can refund without a return, for example for an
-item lost in transit, and that refund is audited.
+item lost in transit, and that refund is audited. A partial refund waits for the charge to settle (see Charging
+rules → Refunds).
 
 ### entitlements
 
@@ -531,7 +533,7 @@ that cause them.
 | `price_change` | 7 to 30 days before the renewal at the new price | The new price, and how to cancel |
 | `promo_ending` | 3 to 21 days before a free or discounted period longer than 31 days ends | That it renews, the term, the price and frequency, how to cancel, a cancellation link, contact details |
 | `pre_renewal` | 15 to 45 days before renewal, for terms of a year or more | As `promo_ending`. It replaces `promo_ending` when both would apply |
-| `annual_reminder` | Each anniversary of `started_at`, in a window from 30 days before it to the anniversary itself, for every subscription (D-7). Skipped in a year when a `pre_renewal` notice already went out | The product, the frequency and amount of charges, how to cancel |
+| `annual_reminder` | Each anniversary of `started_at`, in a window from 30 days before it to the anniversary itself, for every subscription (D-7) | The product, the frequency and amount of charges, how to cancel |
 | `cancellation_confirmation` | Right after a cancellation is accepted | What ends and when |
 
 ### Cancellation
@@ -674,6 +676,7 @@ customer and payment profile IDs.
 | submitted_at | timestamptz | |
 | resolved_at | timestamptz, nullable | When the outcome became known |
 | approved_at | timestamptz, nullable | When the gateway approved it; set once, and kept when the row is later voided or settled |
+| unexpected_at | timestamptz, nullable | Set when an approved charge turns out to be an unexpected collection (Charging rules). Such a charge, and its reversal, are left out of collected, reversed and the line caps |
 | settled_at | timestamptz, nullable | |
 | expires_at | timestamptz, nullable | Hold expiry (5 days) or authorization expiry (30 days) |
 
@@ -728,18 +731,18 @@ stateDiagram-v2
 | Timeouts are unknown | A call with no response becomes `unknown`, never `declined` |
 | Resolve, then retry | Every charge and refund the backend sends carries `duplicateWindow` 28800 (the maximum, 8 hours). To resolve an unknown one, it is resent unchanged. A duplicate error comes back as response 3 with error 11 and the original `transId`: the backend then reads that transaction's details and takes its status, rather than recording `error`. Past the window, the attempt is looked up by its invoice number in the unsettled list, and in the settled batches since its `submitted_at`. Only a confirmed decline, or confirmed absence from both, allows a new attempt, and a new attempt has a new reference |
 | Holds | A held charge waits for `fraud.approved` or `fraud.declined`, or for a staff decision, which is audited. A sweep marks it `expired` after 5 days. While it waits, nothing else is charged on the order |
-| Voids and captures | A void cancels a whole unsettled charge or authorization. A capture takes up to the authorized amount, once. Each is its own row, pointing at its parent, and on approval the parent's status changes. A void of a collected charge is a full refund before settlement: it goes through the refund path, with lines, tax reversal, revocations and an audit event |
-| Refunds | Only a settled charge, within 180 days, can be refunded; before settlement it can only be voided. Refunds may be partial and repeated, up to the settled amount. No refund is issued on a charge with a `disputed` or `lost` chargeback |
+| Voids and captures | A void cancels a whole unsettled charge or authorization. A capture takes up to the authorized amount, once. Each is its own row, pointing at its parent, and on approval the parent's status changes. A void that reverses an order's own collection is a full refund before settlement: it goes through the refund path, with lines, tax reversal, revocations and an audit event. It is used only when every line is reversed in full |
+| Refunds | Only a settled charge, within 180 days, can be refunded; before settlement it can only be voided. Refunds may be partial and repeated, up to the settled amount. A partial reversal requested before settlement waits until the charge settles, normally within a day, and is then issued as a refund; it never becomes a void of the whole charge. No refund is issued on a charge with a `disputed` or `lost` chargeback |
 | Chargebacks | A row entered by staff, pointing at the disputed charge, with its own generated reference |
-| Unexpected collections | An approval may arrive for an order that is already paid or cancelled, for example a late webhook. It is recorded, then voided if unsettled or refunded if settled, and logged as an `unexpected_collection` discrepancy for staff. The order's status doesn't change |
+| Unexpected collections | An approval may arrive for an order that is already paid or cancelled, for example a late webhook. The workflow that owns the order sets the charge's `unexpected_at`, and returns the money with a plain void if unsettled or a full refund if settled. That reversal has no `refund_lines`, no tax reversal and no revocations, because nothing the order sold is being returned. In the same transaction, the workflow writes a `payment.unexpected` outbox message, and `reconcile` records the `unexpected_collection` discrepancy for staff. The order's status doesn't change. The zero-total card-saving authorization (Workflows → Checkout) is expected, not unexpected |
 
 ### What counts as collected
 
 | Amount | Definition |
 | --- | --- |
 | Due | The order's `total_amount` |
-| Collected | `amount` of `charge` and `capture` rows with `approved_at` set, whatever their later status |
-| Reversed | `amount` of `refund` rows that are `approved` or `settled`, plus approved `void` rows whose parent was collected |
+| Collected | `amount` of `charge` and `capture` rows with `approved_at` set and `unexpected_at` null, whatever their later status |
+| Reversed | `amount` of `refund` rows that are `approved` or `settled`, plus approved `void` rows whose parent was collected, leaving out reversals of unexpected collections |
 | Charged back | `amount` of `chargeback` rows that are `lost` |
 | Outstanding | Due minus collected. Reversals and chargebacks are reported beside it and never reopen it, so a `paid` order stays paid and is never charged again |
 
@@ -833,12 +836,17 @@ backend call's reference. Each outcome:
 | status | text | `in_progress` or `completed` |
 | response_status | int, nullable | |
 | response_body | jsonb, nullable | Replayed as is for a repeat |
+| effect_ref | text, nullable | What the claiming transaction created, for example `order:123` or `transaction:456` |
 | created_at, expires_at | timestamptz | Kept 24 hours |
 
 - Checkout and refund requests need the header.
-- The key row is inserted in the same transaction as the effect.
-- A repeat while the first request is still `in_progress` gets 409 Conflict with `Retry-After`. A repeat after it
-  completed gets the stored response.
+- The key row is inserted in the same transaction as the effect, with `effect_ref` naming what that transaction
+  created (the order, or the reversal).
+- A repeat while the first request is still `in_progress` gets 409 Conflict with `Retry-After`, for up to 1 minute.
+- After 1 minute an `in_progress` key is treated as interrupted. The repeat resumes from `effect_ref`, by
+  re-issuing the hosted token for the order's open session, or by resolving the reversal as an unknown call. It
+  never repeats the effect.
+- A repeat after the request completed gets the stored response.
 
 ### outbox_messages
 
@@ -859,11 +867,12 @@ them to RabbitMQ (ADR 0001).
 
 | Column | Type | Notes |
 | --- | --- | --- |
-| source | text | Primary key with `message_id`, for example `authorize_net` |
-| message_id | text | The webhook's `notificationId` |
+| source | text | Primary key with `message_id`: `authorize_net` for webhooks, or the consuming component and topic for internal messages, for example `checkout:payment.outcome` |
+| message_id | text | The webhook's `notificationId`, or the outbox message's `id` |
 | payload | jsonb | |
 | received_at, processed_at | timestamptz | `processed_at` nullable |
 
+- The inbox deduplicates both webhooks and internal messages that are consumed from the broker.
 - A webhook is accepted only if its `X-ANET-Signature` matches the HMAC-SHA512 of the raw body under the
   Signature Key.
 - An accepted webhook is stored and acknowledged with 200 at once, then processed. Authorize.Net retries up to 10
@@ -896,7 +905,9 @@ then makes the call, then records the outcome.
   - It settles each `payment_transactions` row's status.
   - In the same transaction, it writes a `payment.outcome` message to the outbox, naming the transaction, its new
     status and its order.
-  - It never touches orders or subscriptions.
+    - It never touches orders or subscriptions.
+  - It also runs staff decisions on held charges (approve or decline through `updateHeldTransaction`, audited), and
+    records the discrepancies that `checkout` and `billing` report as `payment.unexpected` messages.
 - `checkout` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on outcomes for checkout
   orders. It also handles returns and refunds.
 - `billing` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on outcomes for renewal
@@ -915,9 +926,9 @@ Both consume `payment.outcome` through the inbox, so a repeated message changes 
    - insert a `payment_sessions` row, under the session rules.
 4. Ask Authorize.Net for the hosted token. Send the session's reference as the invoice number, plus the customer
    profile with `addPaymentProfile`, so the form can save the card. Then redirect the customer.
-   - If the order has a subscription line but its total is zero, the session runs as an authorization for the
-     smallest amount the processor accepts. That authorization is voided once the card is saved. To be verified in
-     #32.
+      - If the order has a subscription line but its total is zero, the session runs as an authorization for the
+     smallest amount the processor accepts. When that authorization is approved, it is the order's expected
+     outcome: step 6 runs, and the authorization is then voided with no lines. To be verified in #32.
 5. `reconcile` records each attempt the gateway reports as a transaction on the session.
 6. On an approved outcome, `checkout` acts:
    - **First, the card.** If the order has a subscription line and the transaction's details carry no payment
@@ -964,13 +975,14 @@ Both consume `payment.outcome` through the inbox, so a repeated message changes 
 - it has no attempt that is `pending`, `unknown` or `held`;
 - every one of its sessions is `closed`.
 
-Cancelling releases the order's redemption, and its tax record becomes `expired`.
+Cancelling releases the order's redemption, and its tax record becomes `expired`. A renewal cancelled for
+`grace_expired` does the same with its tax record.
 
 **Return and refund** (`checkout`):
 1. A received return, or a staff decision, picks the lines and amounts.
 2. In one transaction: claim the idempotency key, lock the order, check the caps and any chargeback, insert the
-   `pending` reversal and its lines, and write the audit event. The reversal is a refund if the charge has settled,
-   or a void of the whole charge if it hasn't.
+   `pending` reversal and its lines, and write the audit event. The reversal is a refund if the charge has settled. If it hasn't, the reversal is a void of the whole charge, but
+   only when every line is being reversed in full. A partial reversal waits for settlement.
 3. Call the gateway.
 4. On approval, record the tax reversal. If a one-time digital line has now been reversed in full, revoke its
    entitlement. If a subscription's cycle has, end the subscription with `end_reason = 'revoked'`.
@@ -979,7 +991,8 @@ Cancelling releases the order's redemption, and its tax record becomes `expired`
 - process inbox webhooks;
 - resolve `unknown` attempts;
 - mark holds as `expired` after 5 days;
-- move sessions from `expired` to `closed` once the unsettled list has been read past them;
+- move sessions from `open` to `expired` once `token_expires_at` passes without an approval, and from `expired`
+  to `closed` once the unsettled list has been read past them;
 - find hosted attempts that raised no webhook.
 
 Declines and hold expiries raise no webhook of their own, so the sweeps read the reporting API. Unsettled
@@ -1010,10 +1023,10 @@ month), with standard shipping ($6.00).
 
 | Table | Rows written |
 | --- | --- |
-| `orders`, `order_lines`, `subscription_periods` | O-2 `renewal`, total 2160; L-5 newsletter 2000 + 160; P-2 15 Feb–15 Mar billed by L-5 |
+| `orders`, `order_lines`, `subscription_periods`, `tax_records` | O-2 `renewal`, total 2160; L-5 newsletter 2000 + 160; P-2 15 Feb–15 Mar billed by L-5; T-2 `sale`, `calculated`, tax 160 |
 | `payment_transactions` | X-3 charge 2160, reference `RSLR000000002`: `pending`, then `held` (response 4) |
 | `subscriptions` | S-1 `past_due`, `grace_ends_on` 22 Feb. Access continues |
-| 16 February | `fraud.approved` arrives in the inbox. X-3 becomes `approved`, O-2 `paid`, S-1 `active` and paid through 15 Mar, and the tax is recorded |
+| 16 February | `fraud.approved` arrives in the inbox. X-3 becomes `approved`, O-2 `paid`, S-1 `active` and paid through 15 Mar, and T-2 is `recorded` |
 
 ### 3. Price change, decided 1 March for the newsletter's next renewals
 
@@ -1021,7 +1034,7 @@ month), with standard shipping ($6.00).
 | --- | --- |
 | `prices`, `price_transitions` | 1 Mar: newsletter $25.00 a month is added, the $20.00 price is retired, and transition PT-1 moves $20.00 subscribers to $25.00. S-1 is still on $20.00 |
 | `subscription_notices`, `subscription_price_changes` | 1 Mar: S-1's next renewal (15 Mar) is 14 days away, so the notice N-2 and change C-1 for 15 Mar are written. N-2's `sent_at` is 1 Mar |
-| 15 March renewal | 1 Mar is 14 days before 15 Mar, inside 7–30, so C-1 applies. S-1's price becomes $25.00, and L-6 on O-3 bills 2500 + 200 |
+| 15 March renewal | 1 Mar is 14 days before 15 Mar, inside 7–30, so C-1 applies. S-1's price becomes $25.00, and L-6 on O-3 bills 2500 + 200, with T-3 for its tax. Its charge is X-4 |
 
 Had the mail relay been down until 10 March, `sent_at` would have been 5 days before the renewal. C-1 would then
 have become `rescheduled`, 15 March would have billed $20.00, and a new notice would have scheduled the change for

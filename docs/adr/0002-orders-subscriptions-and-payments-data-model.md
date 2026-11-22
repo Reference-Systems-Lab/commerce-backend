@@ -63,13 +63,15 @@ the decisions that shape it.
   Foreign keys may cross domains, since there is one database. Go imports may not. Three workflow components
   coordinate several domains in one database transaction, and go-arch-lint lets no domain depend on a workflow:
   - `reconcile` may depend on payments and reconciliation. It owns everything from the gateway: webhooks, sweeps,
-    lookups and the nightly comparison. It settles each transaction's status, and in the same transaction writes a
-    `payment.outcome` message to the outbox.
+    lookups and the nightly comparison. It settles each transaction's status, and in the same transaction writes a `payment.outcome` message to the
+    outbox. It also runs staff decisions on held charges, which are audited. And it records the discrepancies that
+    the other workflows report as `payment.unexpected` messages.
   - `checkout` handles checkout orders, returns and refunds.
   - `billing` handles renewals, retries, the notice job and abandonment.
 
   `checkout` and `billing` may depend on catalog, customers, promotions, orders, subscriptions, tax and payments.
-  Each consumes `payment.outcome` through the inbox, for its own orders.
+  Each consumes `payment.outcome` through the inbox, for its own orders. The inbox deduplicates internal messages as
+  well as webhooks.
 - **Money** is a `bigint` count of cents. Each document that owns amounts (a price, an order, a transaction, a
   tax record) carries one `currency char(3)` with `CHECK (currency = 'USD')` (D-2). Percentage discounts are stored
   in basis points. An amount for one line rounds half up. An amount split across lines uses the largest-remainder method, so the
@@ -85,8 +87,9 @@ the decisions that shape it.
   A checkout order bills everything bought at once. After that, each cycle of each subscription gets its own
   renewal order.
 - **Fulfilment.** Shipments and returns refer to order lines by quantity, so split shipments and partial returns
-  need nothing extra. A one-time digital purchase grants an entitlement. It is revoked once the line's reversals (refunds, or a void
-  before settlement) reach the line's full total.
+  need nothing extra. A one-time digital purchase grants an entitlement. It is revoked once the line's reversals (refunds, or a void before settlement) reach the line's full total. A void
+  is used only to reverse every line in full; a partial reversal before settlement waits for settlement and is
+  then issued as a refund.
   Subscription access comes from the subscription itself. Stock reservation is a separate issue (D-11), but order
   lines already carry the product and quantity it needs.
 - **Payments.**
@@ -101,8 +104,11 @@ the decisions that shape it.
     subscription line.
   - **Collected and reversed.** A charge counts as collected once approved (`approved_at`), whatever happens to it
     later. Refunds, and voids of collected charges, are reversals reported beside the balance. A paid order is
-    never reopened, and never charged again. An approval that arrives for an order already paid or cancelled is
-    reversed and logged as a discrepancy.
+    never reopened, and never charged again. An approval that arrives for an order already paid or cancelled is an unexpected collection. It is marked
+    `unexpected_at` and left out of the order's sums. The money is returned with a plain void or refund that
+    returns no lines, reverses no tax and revokes nothing, and `reconcile` logs it as a discrepancy. A zero-total
+    checkout with a subscription line runs a card-saving authorization, which is its expected outcome, and is then
+    voided.
   - **Unknown and held.** A call that times out becomes `unknown`, and a fraud hold becomes `held`. Both count as
     neither collected nor declined. Only one charge the backend sends, and one operation per charge, may be open at a time.
   - **Recovering an unknown charge.** The backend sends `duplicateWindow` 28800 with every charge and refund it
@@ -135,7 +141,7 @@ the decisions that shape it.
 - **Tax** comes from Stripe Tax's standalone API (D-13):
   - placing an order stores a calculation, whose tax is frozen on the order lines;
   - payment turns it into a tax transaction, with the order number as its reference;
-  - an abandoned order's calculation is left to expire;
+    - an abandoned checkout's calculation, or a renewal's cancelled for expired grace, is left to expire;
   - a refund records a reversal with its own reference.
 - **Reconciliation.** The gateway's settlement batches and transactions are mirrored as reported, and the
   reconciliation component alone writes them (D-12). A nightly comparison records each unresolved discrepancy once
