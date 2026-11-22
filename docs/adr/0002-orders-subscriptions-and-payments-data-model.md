@@ -54,31 +54,39 @@ the decisions that shape it.
   | `customers` | `customers`, `customer_addresses` |
   | `promotions` | `promotions`, `promotion_products`, `promotion_redemptions` |
   | `orders` | `orders`, `order_addresses`, `order_lines`, `shipments`, `shipment_lines`, `returns`, `return_lines`, `entitlements` |
-  | `subscriptions` | `subscriptions`, `subscription_periods`, `subscription_price_changes`, `subscription_discounts`, `subscription_notices`, `terms_versions`, `subscription_consents` |
+  | `subscriptions` | `subscriptions`, `subscription_periods`, `price_transitions`, `subscription_price_changes`, `subscription_discounts`, `subscription_notices`, `terms_versions`, `subscription_consents` |
   | `tax` | `tax_records` |
   | `payments` | `payment_methods`, `payment_sessions`, `payment_transactions`, `refund_lines` |
   | `reconciliation` | `gateway_batches`, `gateway_transactions`, `reconciliation_discrepancies` |
   | `platform` | `idempotency_keys`, `outbox_messages`, `inbox_messages`, `audit_events` |
 
   Foreign keys may cross domains, since there is one database. Go imports may not. Three workflow components
-  coordinate several domains in one database transaction: `checkout` (checkouts, and returns and refunds), `billing` (renewals, retries, notices and
-  abandonment) and `reconcile`. go-arch-lint lets each depend only on the domains it coordinates, and lets no
-  domain depend on a workflow.
+  coordinate several domains in one database transaction, and go-arch-lint lets no domain depend on a workflow:
+  - `reconcile` may depend on payments and reconciliation. It owns everything from the gateway: webhooks, sweeps,
+    lookups and the nightly comparison. It settles each transaction's status, and in the same transaction writes a
+    `payment.outcome` message to the outbox.
+  - `checkout` handles checkout orders, returns and refunds.
+  - `billing` handles renewals, retries, the notice job and abandonment.
+
+  `checkout` and `billing` may depend on catalog, customers, promotions, orders, subscriptions, tax and payments.
+  Each consumes `payment.outcome` through the inbox, for its own orders.
 - **Money** is a `bigint` count of cents. Each document that owns amounts (a price, an order, a transaction, a
   tax record) carries one `currency char(3)` with `CHECK (currency = 'USD')` (D-2). Percentage discounts are stored
-  in basis points. Every split of an amount follows a stated rounding rule: round half up per line, and give any
-  remainder to the largest line.
+  in basis points. An amount for one line rounds half up. An amount split across lines uses the largest-remainder method, so the
+  parts always add up to the whole.
 - **The catalog.** A product is one sellable SKU, with `kind` either `physical` or `digital` (D-10). Recurrence
-  belongs to the price, not the product, so a physical subscription box needs nothing new. Prices are immutable
-  rows. A product may have several live prices, but only one per currency and interval. A price change is always a
-  new row.
+  belongs to the price, not the product, so a physical subscription box is a physical product with a recurring price. It also carries a shipping address
+  and method, and each renewal bills a shipping line. Prices are immutable
+  rows. A product may have several live prices, but only one per currency and interval. A price change is always a new row. Retiring a price moves no one; a price transition names where its subscribers
+  move to.
 - **The order is the frozen record of what was charged.** It holds the lines (products and shipping), each line's
   unit amount, discount, tax and total, the order totals, and snapshots of the billing and shipping addresses.
   Nothing recalculates it. Shipping is a line of kind `shipping`, so tax and refunds treat it like any other line.
   A checkout order bills everything bought at once. After that, each cycle of each subscription gets its own
   renewal order.
 - **Fulfilment.** Shipments and returns refer to order lines by quantity, so split shipments and partial returns
-  need nothing extra. A one-time digital purchase grants an entitlement, which a full refund of its line revokes.
+  need nothing extra. A one-time digital purchase grants an entitlement. It is revoked once the line's reversals (refunds, or a void
+  before settlement) reach the line's full total.
   Subscription access comes from the subscription itself. Stock reservation is a separate issue (D-11), but order
   lines already carry the product and quantity it needs.
 - **Payments.**
@@ -87,13 +95,22 @@ the decisions that shape it.
     `authorization`, `capture`, `void`, `refund` and `chargeback`.
   - **Gateway IDs.** A gateway transaction ID is unique only for the kinds that receive one: charges,
     authorizations and refunds. A void or capture points at its parent.
-  - **Hosted checkout.** Each checkout is a `payment_sessions` row that owns the invoice number.
+  - **Hosted checkout.** Each checkout is a `payment_sessions` row that owns the invoice number. A new session can
+    open only once every earlier one is closed, which means confirmed through reporting to have no unrecorded
+    attempt, and once nothing on the order is open or collected. A card is always saved for an order with a
+    subscription line.
+  - **Collected and reversed.** A charge counts as collected once approved (`approved_at`), whatever happens to it
+    later. Refunds, and voids of collected charges, are reversals reported beside the balance. A paid order is
+    never reopened, and never charged again. An approval that arrives for an order already paid or cancelled is
+    reversed and logged as a discrepancy.
   - **Unknown and held.** A call that times out becomes `unknown`, and a fraud hold becomes `held`. Both count as
-    neither collected nor declined. Only one charge and one refund may be open at a time.
-  - **Recovering an unknown charge.** The backend sends `duplicateWindow` 28800 with every charge it makes, and
-    resolves an unknown attempt by resending it unchanged.
-  - **Refunds.** Each refund is split across order lines. Every refund that hasn't failed counts against a line's
-    total.
+    neither collected nor declined. Only one charge the backend sends, and one operation per charge, may be open at a time.
+  - **Recovering an unknown charge.** The backend sends `duplicateWindow` 28800 with every charge and refund it
+    makes, and resolves an unknown one by resending it unchanged. The duplicate error carries the original
+    `transId`, whose details give the outcome. Past the window, it checks the unsettled list and the settled batches
+    by invoice number before treating the charge as absent.
+  - **Refunds.** Each reversal is split across order lines. Every reversal that hasn't failed counts against a
+    line's total. No refund is issued against a disputed or lost chargeback.
 - **Subscriptions.**
   - **Periods.** A subscription keeps its billing day (`anchor_day`, clamped to the month's length). Each period is
     linked to the one order line that billed it, and the link is unique on the period's start, so a renewal
@@ -101,8 +118,9 @@ the decisions that shape it.
   - **Access** lasts through `paid_through`. When a renewal isn't collected by the period's start, for whatever
     reason, access continues through `grace_ends_on`, 7 days later (D-6).
   - **Price changes** are `subscription_price_changes` rows, each scheduled for one renewal of one subscription.
-    A change applies only if its notice's `sent_at` falls 7 to 30 days before that renewal. Otherwise it moves to
-    a later renewal with a new notice.
+    Each carries out a `price_transitions` decision. A change applies only if its notice was sent between 30 and 7
+    days before that renewal, counted in UTC dates and inclusive. Otherwise it moves to a later renewal with a new
+    notice. Notices are written 10 to 30 days ahead, which leaves room for mail delays.
 - **Notices.** `subscription_notices` schedules each notice the California rules require for every subscription:
   - the acknowledgment;
   - the price-change notice;
@@ -127,8 +145,10 @@ the decisions that shape it.
   - `outbox_messages` carries notices and domain events.
   - `inbox_messages` deduplicates webhooks on `notificationId`, after their HMAC-SHA512 signature is verified.
   - `audit_events` is append-only and names the actor for every staff action on money or access.
-- **Abandonment.** A checkout order is cancelled 24 hours after it was placed if it has collected nothing and has
-  no open attempt. Cancelling it releases its promotion redemption.
+- **Abandonment.** A checkout order is cancelled 24 hours after it was placed if it has collected nothing, has no
+  open attempt and has every session closed. Cancelling it releases its promotion redemption. A renewal whose grace
+  has expired is cancelled under the same conditions. A subscription set to cancel at period end ends at that
+  date, and is never renewed.
 
 ## Alternatives
 
@@ -158,8 +178,14 @@ the decisions that shape it.
 
 - **The catalog and its API change incompatibly.** `00001_products` is rewritten, so existing local databases need
   `make reset` on the platform. The `Product` API gains `kind` and `prices[]` in place of `price`, and the
-  storefront changes in the same release. The breaking-change check in `scripts/check-spec.sh` is passed
-  deliberately: the change is reviewed and named in the PR, not by turning the check off.
+  storefront changes in the same release. This refines ADR 0001's rule that "a breaking change fails CI until it is versioned":
+  - **While `/v1`'s only consumers are first-party applications released alongside the backend** (today, the
+    storefront), a breaking change may stay in `/v1`.
+  - **#31 adds `api/accepted-breaking-changes.txt`.** `scripts/check-spec.sh` passes it to `oasdiff breaking` with
+    `--err-ignore`. Each entry names one break and the PR that accepted it, so the exception is reviewed in the
+    diff, never by turning the check off.
+  - **The file is emptied by the next release.**
+  - **Once `/v1` has a consumer outside this system,** a breaking change needs `/v2`.
 - **Checkout depends on webhooks and the reporting API**, because Accept Hosted by redirect returns no result.
   This needs an address the sandbox can reach, plus outbound access and keys for both Authorize.Net and Stripe:
   commerce-platform#36. Until then, sweep jobs over the reporting API find declines and expired holds, which raise

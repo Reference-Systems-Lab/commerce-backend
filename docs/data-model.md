@@ -59,7 +59,7 @@ flowchart TB
 | `customers` | `customers`, `customer_addresses` |
 | `promotions` | `promotions`, `promotion_products`, `promotion_redemptions` |
 | `orders` | `orders`, `order_addresses`, `order_lines`, `shipments`, `shipment_lines`, `returns`, `return_lines`, `entitlements` |
-| `subscriptions` | `subscriptions`, `subscription_periods`, `subscription_price_changes`, `subscription_discounts`, `subscription_notices`, `terms_versions`, `subscription_consents` |
+| `subscriptions` | `subscriptions`, `subscription_periods`, `price_transitions`, `subscription_price_changes`, `subscription_discounts`, `subscription_notices`, `terms_versions`, `subscription_consents` |
 | `tax` | `tax_records` |
 | `payments` | `payment_methods`, `payment_sessions`, `payment_transactions`, `refund_lines` |
 | `reconciliation` | `gateway_batches`, `gateway_transactions`, `reconciliation_discrepancies` |
@@ -75,8 +75,11 @@ flowchart TB
     are all in that currency.
   - Amount columns end in `_amount` and carry `CHECK (… >= 0)`, unless signed.
 - **Percentages** are basis points (`10000` is 100%).
-- **Rounding.** Every split rounds half up, per line. The cent left over from a split goes to the line with the
-  largest amount, and on a tie to the lowest `line_no`.
+- **Rounding.**
+  - An amount computed for one line, such as a percentage discount, rounds half up.
+  - An amount split across lines uses the largest-remainder method. Each line gets the floor of its exact share. The
+    cents still unallocated then go one each to the lines with the largest fractional remainders, with ties to the
+    lowest `line_no`. So the parts always add up to the whole.
 - **Time.**
   - Instants are `timestamptz`; billing dates are `date`, in UTC.
   - Business code reads the time only through `clock.Clock`.
@@ -120,9 +123,10 @@ with a monthly price.
 | retired_at | timestamptz, nullable | Stops new sales; settable once. Existing subscriptions keep the price |
 
 - `CHECK ((interval IS NULL) = (interval_count IS NULL))`.
-- At most one live price per product, currency and interval:
-  `UNIQUE NULLS NOT DISTINCT (product_id, currency, interval, interval_count) WHERE retired_at IS NULL`.
-- Prices are never edited. A new price is a new row, and the old one is retired.
+- At most one live price per product, currency and interval: `CREATE UNIQUE INDEX … ON prices
+  (product_id, currency, interval, interval_count) NULLS NOT DISTINCT WHERE retired_at IS NULL`.
+- Prices are never edited. A new price is a new row.
+- Retiring a price stops new sales, but moves no one. Subscribers move only through a price transition.
 
 ### shipping_methods
 
@@ -145,9 +149,9 @@ Rates by weight or zone are deferred; a flat rate per order is enough for this c
 | Column | Type | Notes |
 | --- | --- | --- |
 | id | bigint, PK | |
-| email | text | `UNIQUE (lower(email))` |
+| email | text | Unique case-insensitively: `CREATE UNIQUE INDEX … ON customers (lower(email))` |
 | name | text | |
-| gateway_customer_profile_id | text, unique, nullable | Authorize.Net CIM customer profile, created at the first saved card |
+| gateway_customer_profile_id | text, unique, nullable | Authorize.Net CIM customer profile. The backend creates it, with no payment profile, before the customer's first hosted session |
 | created_at | timestamptz | |
 
 Sign-in, passwords and sessions belong to the users domain, which a later issue designs. A customer row is the
@@ -239,7 +243,7 @@ Refunds and chargebacks never change `status`. They are reported beside it (see 
 | promotion_redemption_id | FK promotion_redemptions, nullable | The redemption behind the discount |
 | net_amount | bigint, generated | `quantity * unit_amount - discount_amount`, `CHECK (>= 0)`; what tax is calculated on |
 | tax_amount | bigint | Frozen from the tax calculation at placement |
-| total_amount | bigint, generated | `net_amount + tax_amount` |
+| total_amount | bigint, generated | `quantity * unit_amount - discount_amount + tax_amount`. Postgres doesn't let a generated column refer to another one, so it repeats `net_amount`'s expression |
 | tax_code | text | Copied from the product or shipping method at placement |
 
 - `CHECK` that the columns for the line's `kind` are set and the others are null.
@@ -275,7 +279,7 @@ Refunds and chargebacks never change `status`. They are reported beside it (see 
 | status | text | `requested`, `approved`, `received`, `refunded`, `rejected` or `canceled` |
 | reason | text | |
 | requested_at, received_at | timestamptz | `received_at` nullable |
-| refund_transaction_id | FK payment_transactions, nullable | The refund issued for it |
+| refund_transaction_id | FK payment_transactions, nullable | The reversal issued for it: a refund, or a void before settlement |
 
 | return_lines column | Type | Notes |
 | --- | --- | --- |
@@ -299,7 +303,7 @@ item lost in transit, and that refund is audited.
 | revoke_reason | text, nullable | `refunded`, `chargeback` or `staff` |
 
 - A one-time digital purchase grants an entitlement in the same transaction that marks its order paid.
-- A refund covering the line's whole `total_amount`, or a lost chargeback, revokes it.
+- It is revoked once the line's reversals reach its whole `total_amount`, or by a lost chargeback. Reversals are refunds plus voids, summed across all of them.
 - Subscriptions grant access through their own dates (see "Access"), not through entitlements.
 
 ## Promotions
@@ -310,11 +314,11 @@ item lost in transit, and that refund is audited.
 | --- | --- | --- |
 | id | bigint, PK | |
 | name | text | Internal name |
-| code | text, nullable | What the customer types; `UNIQUE (lower(code))`; null means it applies automatically |
+| code | text, nullable | What the customer types; unique case-insensitively (`CREATE UNIQUE INDEX … ON promotions (lower(code))`); null means it applies automatically |
 | discount_kind | text | `percent` or `amount` |
 | percent_off_bp | int, nullable | 1 to 10000; set when `percent` |
 | amount_off | bigint, nullable | Cents; set when `amount`, together with `currency` |
-| currency | char(3), nullable | |
+| currency | char(3), nullable | Set exactly when `amount_off` is: `CHECK ((amount_off IS NULL) = (currency IS NULL))` and `CHECK (currency IS NULL OR currency = 'USD')` |
 | applies_to | text | `all` or `listed` products |
 | duration | text | `once`, `repeating` or `forever`; matters for subscriptions |
 | duration_cycles | smallint, nullable | Billing cycles, counting the checkout's; set only when `repeating` |
@@ -337,7 +341,7 @@ item lost in transit, and that refund is audited.
 | --- | --- | --- |
 | id | bigint, PK | |
 | promotion_id | FK promotions | |
-| order_id | FK orders | The checkout order that used it; `UNIQUE (promotion_id, order_id)` |
+| order_id | FK orders, unique | The checkout order that used it. `UNIQUE (order_id)` enforces one promotion per order |
 | customer_id | FK customers | |
 | redeemed_at | timestamptz | |
 | released_at | timestamptz, nullable | Set when the order is cancelled, which gives the use back |
@@ -353,7 +357,7 @@ item lost in transit, and that refund is audited.
 | One promotion per order | Promotions don't stack. Checkout applies the single best eligible one |
 | Which lines | Product lines the promotion applies to. Shipping lines are never discounted (free shipping is deferred) |
 | Percent | Each line's discount is `round_half_up(quantity × unit_amount × percent_off_bp / 10000)` |
-| Fixed amount | Split across the eligible lines in proportion to their `quantity × unit_amount`, with the leftover cent going to the largest line, and never more than a line's amount |
+| Fixed amount | Split across the eligible lines in proportion to their `quantity × unit_amount` by the largest-remainder method (Conventions), capped at the eligible lines' total |
 | Renewals | A renewal discount points back at the original redemption and isn't a new use |
 
 ### subscription_discounts
@@ -366,7 +370,8 @@ item lost in transit, and that refund is audited.
 | percent_off_bp | int | Copied from the promotion |
 | cycles_remaining | smallint, nullable | Discounted renewals still to come; null for `forever` |
 
-- Created with `cycles_remaining = duration_cycles - 1`, because the checkout used the first cycle.
+- Created only for a `repeating` or `forever` promotion. A `once` promotion discounts the checkout line alone.
+- `cycles_remaining` starts at `duration_cycles - 1` for `repeating`, because the checkout used the first cycle. It is null for `forever`.
 - The renewal puts the discount on the new line, and lowers `cycles_remaining`, in the same transaction.
 - Counting cycles rather than dates means a late payment or a short month can't add or drop a discounted cycle.
 
@@ -380,9 +385,10 @@ item lost in transit, and that refund is audited.
 | customer_id | FK customers | |
 | origin_order_line_id | FK order_lines, unique | The checkout line that started it |
 | price_id | FK prices | The agreed recurring price; the product comes from it |
-| payment_method_id | FK payment_methods | The card renewals charge |
+| payment_method_id | FK payment_methods | The card renewals charge. A subscription is created only once its checkout has saved a card (see Checkout) |
 | billing_address_id | FK customer_addresses | Copied onto each renewal order |
 | shipping_address_id | FK customer_addresses, nullable | Required when the product is physical |
+| shipping_method_id | FK shipping_methods, nullable | Required when the product is physical. Each renewal adds a shipping line at the method's current amount |
 | status | text | `active`, `past_due` or `ended` |
 | anchor_day | smallint | 1 to 31: the day of the month the subscription renews on |
 | started_at | timestamptz | |
@@ -399,6 +405,7 @@ item lost in transit, and that refund is audited.
 
 - `CHECK ((status = 'past_due') = (grace_ends_on IS NOT NULL))`.
 - `CHECK ((status = 'ended') = (ended_at IS NOT NULL))`.
+- `CHECK ((shipping_address_id IS NULL) = (shipping_method_id IS NULL))`. Both are set for physical products, which the `billing` workflow checks against the product.
 - An ended subscription is never reactivated. A returning customer gets a new one.
 - Pausing isn't supported.
 
@@ -451,7 +458,8 @@ date; it doesn't move the anchor.
 | --- | --- | --- |
 | id | bigint, PK | |
 | subscription_id | FK subscriptions | |
-| from_price_id, to_price_id | FK prices | |
+| price_transition_id | FK price_transitions | The decision this change carries out |
+| from_price_id, to_price_id | FK prices | Copied from the transition |
 | effective_on | date | The renewal date it is scheduled for, which is that cycle's `period_start` |
 | notice_id | FK subscription_notices, unique | Required: a change can't exist without its notice |
 | status | text | `scheduled`, `applied`, `rescheduled` or `canceled` |
@@ -461,14 +469,30 @@ date; it doesn't move the anchor.
 - At most one scheduled change per subscription: a partial unique index on `subscription_id` where
   `status = 'scheduled'`.
 
+### price_transitions
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| id | bigint, PK | |
+| from_price_id | FK prices | The price subscribers move away from |
+| to_price_id | FK prices | The price they move to; same product, currency and interval |
+| decided_at | timestamptz | |
+| decided_by | text | The staff member, also written to `audit_events` |
+| status | text | `active`, `completed` (no subscriber left on `from_price_id`) or `canceled` |
+
+- At most one active transition per `from_price_id`.
+- Retiring a price alone keeps its subscribers on it. A transition is what moves them, and it names exactly where to.
+
 **How a price change rolls out:**
-1. A new row goes into `prices`, and the old one is retired.
-2. Each day, the notice job finds subscriptions on the old price whose next renewal is 7 to 30 days away. For each,
-   in one transaction, it writes a `price_change` notice and a `scheduled` change for that renewal. The notice goes
-   out through the outbox.
-3. At the renewal, the change applies only if its notice's `sent_at` falls 7 to 30 days before `effective_on`.
-   If it does, the subscription's `price_id` becomes `to_price_id`, the change is `applied`, and the new line
-   bills the new price.
+1. A new row goes into `prices`, the old one is usually retired, and an `active` transition records the move.
+2. Each day, the notice job finds subscriptions on an active transition's `from_price_id` whose next renewal is 10
+   to 30 days away. For each, in one transaction, it writes a `price_change` notice and a `scheduled` change for
+   that renewal. The notice goes out through the outbox. Starting at 10 days, not 7, leaves three days for mail
+   delays.
+3. At the renewal, the change applies only if the notice's send date (`sent_at` in UTC, as a date) is between 30
+   and 7 days before `effective_on`, both inclusive: `effective_on - 30 <= sent_at::date <= effective_on - 7`. If
+   it does, the subscription's `price_id` becomes `to_price_id`, the change is `applied`, and the new line bills the
+   new price.
 4. Otherwise, for example because the email bounced or the relay was down, the change becomes `rescheduled`. The
    renewal bills the old price, and step 2 picks the subscription up again for a later renewal.
 
@@ -483,7 +507,7 @@ sent inside the window.
 | id | bigint, PK | |
 | subscription_id | FK subscriptions | |
 | kind | text | `acknowledgment`, `price_change`, `promo_ending`, `pre_renewal`, `annual_reminder` or `cancellation_confirmation` |
-| window_start, window_end | date | When it may be sent, from the schedule below |
+| window_start, window_end | date | When it may be sent, from the schedule below. The notice job queues it on the first day of its window |
 | status | text | `scheduled`, `queued`, `sent`, `failed` or `skipped` |
 | outbox_message_id | FK outbox_messages, nullable | Set when queued |
 | sent_at | timestamptz, nullable | Set when the mail relay accepts the message, not when the row is written |
@@ -491,6 +515,12 @@ sent inside the window.
 | created_at | timestamptz | |
 
 `UNIQUE (subscription_id, kind, window_start)`, so the job can't schedule the same notice twice.
+
+**The notice job** (`billing`) runs daily. For each subscription that isn't ended, it computes from the schedule
+which `promo_ending`, `pre_renewal` and `annual_reminder` notices are due, and inserts any that are missing. It also
+writes `price_change` notices for active price transitions, and queues every notice whose window has opened
+through the outbox. The `acknowledgment` and `cancellation_confirmation` notices are written by the transactions
+that cause them.
 
 **The notice schedule.** It follows the California automatic renewal law (Bus. & Prof. Code § 17602), read as on
 22 November 2026. It is an engineering reading, not legal advice.
@@ -501,7 +531,7 @@ sent inside the window.
 | `price_change` | 7 to 30 days before the renewal at the new price | The new price, and how to cancel |
 | `promo_ending` | 3 to 21 days before a free or discounted period longer than 31 days ends | That it renews, the term, the price and frequency, how to cancel, a cancellation link, contact details |
 | `pre_renewal` | 15 to 45 days before renewal, for terms of a year or more | As `promo_ending`. It replaces `promo_ending` when both would apply |
-| `annual_reminder` | Once a year, for every subscription (D-7) | The product, the frequency and amount of charges, how to cancel |
+| `annual_reminder` | Each anniversary of `started_at`, in a window from 30 days before it to the anniversary itself, for every subscription (D-7). Skipped in a year when a `pre_renewal` notice already went out | The product, the frequency and amount of charges, how to cancel |
 | `cancellation_confirmation` | Right after a cancellation is accepted | What ends and when |
 
 ### Cancellation
@@ -555,7 +585,7 @@ Stripe payments.
 | id | bigint, PK | |
 | order_id | FK orders | |
 | kind | text | `sale` or `return` |
-| refund_transaction_id | FK payment_transactions, nullable | Set on a return; it must be a refund on the same order |
+| refund_transaction_id | FK payment_transactions, nullable | Set on a return: the reversal (a refund, or a void of a collected charge) on the same order |
 | currency | char(3) | `USD` |
 | tax_amount | bigint | Matches the sum of the lines' tax on a sale, or the refund lines' tax on a return |
 | calculation_id | text, unique, nullable | The Stripe Tax calculation (sales only) |
@@ -566,7 +596,7 @@ Stripe payments.
 | recorded_at | timestamptz, nullable | |
 
 - At most one sale per order: a partial unique index on `order_id` where `kind = 'sale'`.
-- At most one return per refund: a partial unique index on `refund_transaction_id`.
+- At most one return per reversal: a partial unique index on `refund_transaction_id`.
 
 | Event | What happens |
 | --- | --- |
@@ -607,11 +637,19 @@ customer and payment profile IDs.
 | id | bigint, PK | |
 | order_id | FK orders | |
 | reference | varchar(20), unique | Sent as the invoice number; Authorize.Net allows 20 characters |
-| status | text | `open`, `completed` or `expired` |
+| status | text | `open`, `completed` (an attempt was approved), `expired` (the token ran out without an approval seen) or `closed` (expired, and confirmed through the reporting API to have no attempt left unrecorded) |
 | token_expires_at | timestamptz | 15 minutes after the token was issued |
 | created_at, completed_at | timestamptz | `completed_at` nullable |
 
 - At most one open session per order: a partial unique index on `order_id` where `status = 'open'`.
+- A new session may be opened only when all of these hold:
+  - the order has no transaction that is `pending`, `unknown` or `held`;
+  - it has no collected charge;
+  - every earlier session is `closed`.
+
+  A session becomes `closed` once a sweep, at least 30 minutes after `token_expires_at`, has read the unsettled
+  list and recorded every attempt under the session's reference. So a customer can't be charged in a second
+  session while an attempt from the first is still unreported or under review.
 - On the hosted form, a customer who is declined can try again. Each attempt the gateway reports under the
   session's invoice number becomes its own transaction row.
 
@@ -635,6 +673,7 @@ customer and payment profile IDs.
 | auth_code | text, nullable | |
 | submitted_at | timestamptz | |
 | resolved_at | timestamptz, nullable | When the outcome became known |
+| approved_at | timestamptz, nullable | When the gateway approved it; set once, and kept when the row is later voided or settled |
 | settled_at | timestamptz, nullable | |
 | expires_at | timestamptz, nullable | Hold expiry (5 days) or authorization expiry (30 days) |
 
@@ -643,10 +682,13 @@ customer and payment profile IDs.
 - **Gateway IDs.** A gateway ID belongs only to the kinds that get one of their own: a unique index on
   `gateway_transaction_id` where `kind IN ('charge', 'authorization', 'refund')`. A void or capture returns its
   parent's ID, so it isn't stored on the void or capture row.
-- **One open charge per order:** a unique index on `order_id` where `kind IN ('charge', 'authorization')` and
-  `status IN ('pending', 'unknown', 'held')`.
-- **One open refund, void or capture per parent:** a unique index on `(parent_id, kind)` where
-  `kind IN ('refund', 'void', 'capture')` and `status IN ('pending', 'unknown')`.
+- **One open charge per order:** a unique index on `order_id` where `kind IN ('charge', 'authorization')`,
+  `status IN ('pending', 'unknown', 'held')` and `payment_session_id IS NULL`. It covers the calls the backend
+  makes. Hosted attempts have already happened by the time they are recorded, so they are always recorded; the
+  session rules keep them to one session at a time.
+- **One open operation per parent:** a unique index on `parent_id` where `kind IN ('refund', 'void', 'capture')`
+  and `status IN ('pending', 'unknown')`. So a void and a refund, or a void and a capture, can't be open on the same
+  charge at once.
 
 **Charges and authorizations:**
 
@@ -665,12 +707,15 @@ stateDiagram-v2
   held --> approved: fraud.approved, or staff approve
   held --> declined: fraud.declined, or staff decline
   held --> expired: 5 days without a decision
-  approved --> settled: settlement batch
+    approved --> settled: settlement batch
   approved --> voided: void approved
+  approved --> captured: capture approved (authorizations)
+  approved --> expired: authorization not captured in 30 days
 ```
 
 - **Refunds, voids and captures** go `pending → approved | declined | error | unknown`, and a refund goes
-  `approved → settled`.
+  `approved → settled`. An unknown void or capture is resolved from its parent's transaction details:
+  `voided` or `capturedPendingSettlement` means it was approved. An unknown refund is resolved like a charge (below).
 - **A chargeback** is entered by staff from the processor's notice, because no webhook reports one. It is
   `disputed`, then `lost` or `won`.
 
@@ -681,24 +726,25 @@ stateDiagram-v2
 | Check before charging | Lock the order row and confirm it still has an outstanding balance before inserting a charge. A paid order is never charged again |
 | Save before sending | The row is written as `pending`, with its reference, and committed before the gateway is called |
 | Timeouts are unknown | A call with no response becomes `unknown`, never `declined` |
-| Resolve, then retry | Every charge the backend sends carries `duplicateWindow` 28800 (the maximum, 8 hours). To resolve an unknown attempt, it is resent unchanged, and a duplicate error (code 11) returns the original transaction ID. Past the window, the attempt is looked up in the unsettled list by its invoice number. Only a confirmed decline, or confirmed absence, allows a new attempt, and a new attempt has a new reference |
+| Resolve, then retry | Every charge and refund the backend sends carries `duplicateWindow` 28800 (the maximum, 8 hours). To resolve an unknown one, it is resent unchanged. A duplicate error comes back as response 3 with error 11 and the original `transId`: the backend then reads that transaction's details and takes its status, rather than recording `error`. Past the window, the attempt is looked up by its invoice number in the unsettled list, and in the settled batches since its `submitted_at`. Only a confirmed decline, or confirmed absence from both, allows a new attempt, and a new attempt has a new reference |
 | Holds | A held charge waits for `fraud.approved` or `fraud.declined`, or for a staff decision, which is audited. A sweep marks it `expired` after 5 days. While it waits, nothing else is charged on the order |
-| Voids and captures | A void cancels a whole unsettled charge. A capture takes up to the authorized amount, once. Each is its own row, pointing at its parent, and on approval the parent's status changes |
-| Refunds | Only a settled charge, within 180 days, can be refunded; before settlement it can only be voided. Refunds may be partial and repeated, up to the settled amount |
+| Voids and captures | A void cancels a whole unsettled charge or authorization. A capture takes up to the authorized amount, once. Each is its own row, pointing at its parent, and on approval the parent's status changes. A void of a collected charge is a full refund before settlement: it goes through the refund path, with lines, tax reversal, revocations and an audit event |
+| Refunds | Only a settled charge, within 180 days, can be refunded; before settlement it can only be voided. Refunds may be partial and repeated, up to the settled amount. No refund is issued on a charge with a `disputed` or `lost` chargeback |
 | Chargebacks | A row entered by staff, pointing at the disputed charge, with its own generated reference |
+| Unexpected collections | An approval may arrive for an order that is already paid or cancelled, for example a late webhook. It is recorded, then voided if unsettled or refunded if settled, and logged as an `unexpected_collection` discrepancy for staff. The order's status doesn't change |
 
 ### What counts as collected
 
 | Amount | Definition |
 | --- | --- |
 | Due | The order's `total_amount` |
-| Collected | `amount` of `charge` rows that are `approved` or `settled`, plus `capture` rows that are `approved` or `settled` |
-| Refunded | `amount` of `refund` rows that are `approved` or `settled` |
+| Collected | `amount` of `charge` and `capture` rows with `approved_at` set, whatever their later status |
+| Reversed | `amount` of `refund` rows that are `approved` or `settled`, plus approved `void` rows whose parent was collected |
 | Charged back | `amount` of `chargeback` rows that are `lost` |
-| Outstanding | Due minus collected. Refunds and chargebacks are reported beside it and never reopen it |
+| Outstanding | Due minus collected. Reversals and chargebacks are reported beside it and never reopen it, so a `paid` order stays paid and is never charged again |
 
 - An authorization holds funds but collects nothing.
-- A voided, declined, expired or held charge counts for nothing.
+- A declined, errored, expired or held charge collects nothing. A voided charge that was approved first did collect, and its void counts as a reversal.
 - A capture can be for less than its authorization, so the capture's own amount is what counts.
 
 ### refund_lines
@@ -706,15 +752,16 @@ stateDiagram-v2
 | Column | Type | Notes |
 | --- | --- | --- |
 | id | bigint, PK | |
-| refund_transaction_id | FK payment_transactions | A row of kind `refund`; `UNIQUE (refund_transaction_id, order_line_id)` |
+| transaction_id | FK payment_transactions | A reversal: a `refund`, or a `void` of a collected charge. `UNIQUE (transaction_id, order_line_id)` |
 | order_line_id | FK order_lines | Which line the money was for, shipping included |
 | amount | bigint | The net amount refunded for the line |
 | tax_amount | bigint | The tax refunded for the line |
 
-- The refund's `amount` equals the sum of its lines' `amount + tax_amount`.
-- For each order line, `amount + tax_amount` summed over every refund not `declined` or `error` (pending and
-  unknown ones included) never exceeds the line's `total_amount`. The refund workflow checks this while holding
-  the order row locked, and a constraint trigger checks it again.
+- A reversal's `amount` equals the sum of its lines' `amount + tax_amount`. A void covers every line in full.
+- For each order line, `amount + tax_amount` summed over every reversal not `declined` or `error` (pending and
+  unknown ones included) never exceeds the line's `total_amount`. A lost chargeback uses up the rest of its
+  charge's lines. The refund workflow checks this while holding the order row locked, and a constraint trigger
+  checks it again.
 
 ## Reconciliation
 
@@ -738,10 +785,11 @@ component alone writes them (D-12).
 | batch_id | FK gateway_batches, nullable | Null until settled |
 | transaction_type, transaction_status | text | As reported |
 | invoice_number | text, nullable | The reference, when the backend or a session sent it |
+| currency | char(3) | `USD`; the gateway account's currency |
 | auth_amount, settle_amount | bigint | Cents |
 | customer_profile_id, payment_profile_id | text, nullable | |
 | submitted_at | timestamptz | |
-| raw | jsonb | The full payload as received |
+| raw | jsonb | The payload as received, minus `billTo`, `shipTo`, `customer`, `customerIP` and `payment`. The masked card and the customer's details stay out of the mirror; the IDs and amounts above are what reconciliation needs |
 | first_seen_at, last_synced_at | timestamptz | The sync updates rows as their status changes |
 
 ### reconciliation_discrepancies
@@ -749,7 +797,7 @@ component alone writes them (D-12).
 | Column | Type | Notes |
 | --- | --- | --- |
 | id | bigint, PK | |
-| kind | text | `missing_in_app`, `missing_in_gateway`, `amount_mismatch` or `status_mismatch` |
+| kind | text | `missing_in_app`, `missing_in_gateway`, `amount_mismatch`, `status_mismatch` or `unexpected_collection` |
 | payment_transaction_id | FK payment_transactions, nullable | |
 | gateway_trans_id | text, nullable | |
 | expected, actual | text | What the backend believed, and what the gateway reported |
@@ -758,8 +806,9 @@ component alone writes them (D-12).
 | resolved_by | text, nullable | The staff member, also written to `audit_events` |
 | note | text, nullable | |
 
-`UNIQUE NULLS NOT DISTINCT (kind, payment_transaction_id, gateway_trans_id) WHERE resolved_at IS NULL`, so a
-problem that is still open isn't logged again every night.
+- `CHECK (payment_transaction_id IS NOT NULL OR gateway_trans_id IS NOT NULL)`.
+- `CREATE UNIQUE INDEX … ON reconciliation_discrepancies (kind, payment_transaction_id, gateway_trans_id) NULLS
+  NOT DISTINCT WHERE resolved_at IS NULL`, so a problem that is still open isn't logged again every night.
 
 **The nightly comparison** reads the settled batches and the unsettled list, then matches gateway rows to
 transactions. It matches on the transaction ID first, then on the invoice number: a session's reference, or a
@@ -786,7 +835,10 @@ backend call's reference. Each outcome:
 | response_body | jsonb, nullable | Replayed as is for a repeat |
 | created_at, expires_at | timestamptz | Kept 24 hours |
 
-Checkout and refund requests need the header. The key row is inserted in the same transaction as the effect.
+- Checkout and refund requests need the header.
+- The key row is inserted in the same transaction as the effect.
+- A repeat while the first request is still `in_progress` gets 409 Conflict with `Retry-After`. A repeat after it
+  completed gets the stored response.
 
 ### outbox_messages
 
@@ -836,62 +888,102 @@ Append-only: a trigger rejects `UPDATE` and `DELETE`.
 ## Workflows
 
 Calls to outside services are never made inside a database transaction. Each workflow writes its intent first,
-then calls, then records the outcome.
+then makes the call, then records the outcome.
+
+**Who does what.** Each workflow may depend only on the domains named here (go-arch-lint):
+- `reconcile` (payments, reconciliation) owns everything that comes from the gateway: webhooks, sweeps, lookups and
+  the nightly comparison.
+  - It settles each `payment_transactions` row's status.
+  - In the same transaction, it writes a `payment.outcome` message to the outbox, naming the transaction, its new
+    status and its order.
+  - It never touches orders or subscriptions.
+- `checkout` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on outcomes for checkout
+  orders. It also handles returns and refunds.
+- `billing` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on outcomes for renewal
+  orders. It also runs renewals, retries, the notice job and abandonment.
+
+Both consume `payment.outcome` through the inbox, so a repeated message changes nothing.
 
 **Checkout** (`checkout`):
-1. Price the request, and get a Stripe Tax calculation for the lines and the shipping address. Outside a
-   transaction, an unused calculation costs nothing.
-2. In one transaction, do all of the following:
+1. Price the request, and get a Stripe Tax calculation for the lines, using the shipping address if there is one.
+   This runs outside a transaction, and an unused calculation costs nothing.
+2. If the customer has no `gateway_customer_profile_id`, create an empty CIM customer profile and store it.
+3. In one transaction:
    - claim the idempotency key;
    - lock and redeem the promotion, if there is one;
    - insert the order, its addresses and lines, the consents (when built) and the `calculated` tax record;
-   - insert a `payment_sessions` row.
-3. Ask Authorize.Net for the hosted token, sending the session's reference as the invoice number and the
-   customer's profile, so a card can be saved, then redirect the customer.
-4. The gateway reports each attempt through webhooks and the reporting API, and each becomes a transaction on the
-   session. When one is approved, in one transaction:
-   - the order becomes `paid`;
-   - each subscription line creates its `subscriptions` row and first period;
-   - each digital line grants its entitlement;
-   - the saved card becomes a `payment_methods` row;
-   - the acknowledgment notices are scheduled;
-   - an `order.paid` event goes to the outbox.
-5. The tax transaction is recorded from the calculation.
+   - insert a `payment_sessions` row, under the session rules.
+4. Ask Authorize.Net for the hosted token. Send the session's reference as the invoice number, plus the customer
+   profile with `addPaymentProfile`, so the form can save the card. Then redirect the customer.
+   - If the order has a subscription line but its total is zero, the session runs as an authorization for the
+     smallest amount the processor accepts. That authorization is voided once the card is saved. To be verified in
+     #32.
+5. `reconcile` records each attempt the gateway reports as a transaction on the session.
+6. On an approved outcome, `checkout` acts:
+   - **First, the card.** If the order has a subscription line and the transaction's details carry no payment
+     profile, it saves the card with `createCustomerProfileFromTransaction`. This is an outside call, so it comes
+     before the transaction. To be verified in #32.
+   - **Then, in one transaction:**
+     - the order becomes `paid`;
+     - the session becomes `completed`;
+     - the card becomes a `payment_methods` row;
+     - each subscription line creates its `subscriptions` row (with that card) and its first period;
+     - each digital line grants its entitlement;
+     - the acknowledgment notices are written;
+     - an `order.paid` event goes to the outbox.
+   - If the order was already paid or cancelled, the approval is an unexpected collection instead (Charging rules).
+7. The tax transaction is recorded from the calculation.
 
-**Renewal** (`billing`), for each subscription whose `current_period_end` has arrived:
-1. Get a tax calculation for the new cycle.
-2. In one transaction:
+**Renewal** (`billing`). For each subscription that isn't ended and whose `current_period_end` has arrived:
+1. If `cancel_at_period_end` is set, the subscription ends (`end_reason = 'canceled'`). It isn't renewed, and the
+   remaining steps are skipped.
+2. Work out the new cycle's line, reading without writing:
+   - the price, after any scheduled change whose notice qualifies;
+   - the discount;
+   - for a physical product, a shipping line at the subscription's shipping method's current amount.
+   Then get a tax calculation for exactly those lines and the subscription's address.
+3. In one transaction:
    - lock the subscription;
-   - apply a scheduled price change if its notice qualifies, or mark it `rescheduled`;
-   - insert the renewal order, its line and the new period;
-   - apply the discount;
+   - check that step 2's inputs haven't changed, and if they have, start again from step 2;
+   - apply the price change, or mark it `rescheduled`;
+   - insert the renewal order, its lines, the new period and its `calculated` tax record;
+   - lower the discount's `cycles_remaining`;
    - insert a `pending` charge.
-3. Call the gateway with the payment profile and `duplicateWindow`.
-4. On approval: the order becomes `paid`, `paid_through` becomes the period's `period_end`, the tax is recorded, and
-   a physical product gets a shipment.
-5. Otherwise: the subscription becomes `past_due`, with `grace_ends_on` and `next_attempt_at` set. Retries run
-   at 1, 3 and 5 days, each a new attempt with a new reference once the previous one is resolved.
-6. When grace expires unpaid: the order is cancelled (`grace_expired`), and the subscription ends.
+4. Call the gateway with the payment profile and `duplicateWindow`.
+5. On approval: the order becomes `paid`, `paid_through` becomes the period's `period_end`, the tax is recorded,
+   and a physical product gets a shipment.
+6. Otherwise: the subscription becomes `past_due`, with `grace_ends_on` and `next_attempt_at` set. Retries run at
+   1, 3 and 5 days. Each is a new attempt with a new reference, made only once the previous one is resolved.
+7. When grace expires, `billing` cancels the order (`grace_expired`) and ends the subscription, but only if the
+   order has collected nothing and has no attempt that is `pending`, `unknown` or `held`. Otherwise it waits for
+   that attempt to resolve. Holds expire in 5 days, and unknowns are resolved within the duplicate window.
 
-**Abandonment** (`billing`). Every hour, a checkout order still `placed` after its `expires_at`, with no open
-charge or session, is cancelled. Cancelling it releases its redemption, and its tax record becomes `expired`.
+**Abandonment** (`billing`). Every hour, it cancels each checkout order that is still `placed` after its
+`expires_at`, as long as all of these hold:
+- the order has collected nothing;
+- it has no attempt that is `pending`, `unknown` or `held`;
+- every one of its sessions is `closed`.
 
-**Return and refund** (`checkout`'s refund path):
+Cancelling releases the order's redemption, and its tax record becomes `expired`.
+
+**Return and refund** (`checkout`):
 1. A received return, or a staff decision, picks the lines and amounts.
-2. In one transaction: claim the idempotency key, lock the order, check the caps, insert the `pending` refund and
-   its lines, and write the audit event.
+2. In one transaction: claim the idempotency key, lock the order, check the caps and any chargeback, insert the
+   `pending` reversal and its lines, and write the audit event. The reversal is a refund if the charge has settled,
+   or a void of the whole charge if it hasn't.
 3. Call the gateway.
-4. On approval: record the tax reversal, and revoke the entitlement or end the subscription if a line or cycle was
-   fully refunded.
+4. On approval, record the tax reversal. If a one-time digital line has now been reversed in full, revoke its
+   entitlement. If a subscription's cycle has, end the subscription with `end_reason = 'revoked'`.
 
 **Sweeps** (`reconcile`), every few minutes:
+- process inbox webhooks;
 - resolve `unknown` attempts;
-- mark expired holds and expired sessions;
-- process inbox messages;
+- mark holds as `expired` after 5 days;
+- move sessions from `expired` to `closed` once the unsettled list has been read past them;
 - find hosted attempts that raised no webhook.
 
-Declines and the expiry of a hold raise no webhook of their own, so the sweeps read the reporting API. Unsettled
-transactions show up there within seconds.
+Declines and hold expiries raise no webhook of their own, so the sweeps read the reporting API. Unsettled
+transactions show up there within seconds. Each status the sweeps settle writes its `payment.outcome` message.
 
 ## Worked example
 
@@ -927,7 +1019,7 @@ month), with standard shipping ($6.00).
 
 | Table | Rows written |
 | --- | --- |
-| `prices` | 1 Mar: newsletter $25.00 a month is added, and the $20.00 price retired. S-1 keeps $20.00 |
+| `prices`, `price_transitions` | 1 Mar: newsletter $25.00 a month is added, the $20.00 price is retired, and transition PT-1 moves $20.00 subscribers to $25.00. S-1 is still on $20.00 |
 | `subscription_notices`, `subscription_price_changes` | 1 Mar: S-1's next renewal (15 Mar) is 14 days away, so the notice N-2 and change C-1 for 15 Mar are written. N-2's `sent_at` is 1 Mar |
 | 15 March renewal | 1 Mar is 14 days before 15 Mar, inside 7–30, so C-1 applies. S-1's price becomes $25.00, and L-6 on O-3 bills 2500 + 200 |
 
@@ -939,11 +1031,12 @@ have become `rescheduled`, 15 March would have billed $20.00, and a new notice w
 
 | Table | Rows written |
 | --- | --- |
-| `returns`, `return_lines` | R-1 for L-1, quantity 1: `requested`, then `received` |
+| `returns`, `return_lines` | R-1 for L-1, quantity 1: `requested`, `approved`, then `received` |
 | `payment_transactions` | X-5: refund 2592, parent X-2 (settled), its own gateway ID |
 | `refund_lines` | X-5 against L-1: amount 2400, tax 192 |
 | `tax_records` | T-4, `return`, reference `<O-1 number>-R5`, tax 192, `recorded` |
 | `audit_events` | `refund.issued` by the staff member who approved the return |
+| After approval | R-1 becomes `refunded`, with `refund_transaction_id` X-5 |
 
 O-1 stays `paid`: due 10800, collected 10800, refunded 2592, outstanding 0. The report and the newsletter carry on
 untouched, and the shipping isn't refunded because it wasn't returned.
@@ -966,7 +1059,8 @@ Someone keys a $75.00 charge directly in the Authorize.Net dashboard. The nightl
    sent 7 to 30 days before that renewal.
 6. Every gateway call is a row before it is sent, and an unknown outcome is resolved, never guessed.
 7. Only one charge may be open on an order at a time, and a paid order is never charged again.
-8. Refunds never exceed what a line cost, counting every refund that hasn't failed.
+8. Reversals (refunds, and voids of collected charges) never exceed what a line cost, counting every one that hasn't
+   failed, and none is issued against a disputed or lost chargeback.
 9. Access follows what was paid for, plus grace while a renewal is uncollected.
 10. Every staff action on money or access is audited.
 11. There is no foreign key between `payment_transactions` and `gateway_transactions`. Either side can exist
