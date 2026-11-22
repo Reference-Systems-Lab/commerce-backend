@@ -122,6 +122,8 @@ bumps that pin. Verify an artifact with `gh attestation verify --owner Reference
 ## Decisions
 
 - [ADR 0001: The backend's stack](docs/adr/0001-backend-stack.md)
+- [ADR 0002: The orders, subscriptions and payments data model](docs/adr/0002-orders-subscriptions-and-payments-data-model.md),
+  with the schema itself in [the data model](docs/data-model.md)
 
 ## Git hooks
 
@@ -132,7 +134,8 @@ that contains a secret.
 ## Status
 
 The walking skeleton: health, the products list, the OpenAPI contract, the SDK, the image and the
-release. The other domains follow.
+release. The data model for the other domains is designed ([the data model](docs/data-model.md)), and they are
+built from it next.
 
 ## License
 
