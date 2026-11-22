@@ -191,15 +191,16 @@ buyer, whether or not they have an account.
 | placed_at | timestamptz | When the order was written; there are no draft orders |
 | paid_at | timestamptz, nullable | Set in the same transaction that makes the order paid: collected reaches the total and, for an order with a subscription line, the card is saved |
 | canceled_at | timestamptz, nullable | |
-| cancel_reason | text, nullable | `abandoned`, `grace_expired` or `staff` |
+| cancel_reason | text, nullable | `abandoned`, `grace_expired`, `card_not_saved` or `staff` |
 | expires_at | timestamptz, nullable | Checkout orders only: `placed_at + 24 hours`, when an unpaid order may be abandoned |
 
 - `CHECK ((status = 'paid') = (paid_at IS NOT NULL))` and `CHECK ((status = 'canceled') = (canceled_at IS NOT NULL))`.
 - There is no draft order. The cart and price preview are computed without writing rows, and an order exists only
   once checkout places it, with every amount frozen.
 - An order whose total is zero, for example after a 100% discount, is `paid` when it is placed, with no
-  transaction. The exception is an order with a subscription line: it becomes `paid` once its card-saving
-  authorization is approved (see Workflows → Checkout), because the subscription needs a saved card.
+  transaction. The exception is a checkout order with a subscription line: it becomes `paid` once its card-saving
+  authorization is approved (see Workflows → Checkout), because the subscription needs a saved card. A renewal
+  order with a zero total, for example under a 100% repeating discount, is `paid` at placement like any other.
 
 ```mermaid
 stateDiagram-v2
@@ -649,6 +650,7 @@ customer and payment profile IDs.
   order that isn't yet paid. An approval under it for an order that is already paid or cancelled is an unexpected
   collection instead.
 - A new session may be opened only when all of these hold:
+  - the order is `placed`;
   - the order has no transaction that is `pending`, `unknown` or `held`;
   - it has no collected charge;
   - every earlier session is `closed`.
@@ -725,6 +727,11 @@ stateDiagram-v2
 - **Refunds, voids and captures** go `pending → approved | declined | error | unknown`, and a refund goes
   `approved → settled`. An unknown void or capture is resolved from its parent's transaction details:
   `voided` or `capturedPendingSettlement` means it was approved. An unknown refund is resolved like a charge (below).
+- **A void that comes too late.** If a void can't take effect because its charge has settled, the void becomes
+  `declined`. That happens whether the gateway declined it, or the parent's details showed it settled before the
+  void was sent. In the same transaction, the owning workflow writes the reversal again as a `pending` refund of
+  the same lines and amounts, so the requested refund is never lost, and the declined void no longer counts
+  against the caps.
 - **A chargeback** is entered by staff from the processor's notice, because no webhook reports one. It is
   `disputed`, then `lost` or `won`.
 
@@ -926,13 +933,15 @@ then makes the call, then records the outcome.
   - It settles each `payment_transactions` row's status.
   - In the same transaction, it writes a `payment.outcome` message to the outbox, naming the transaction, its new
     status and its order.
-    - It never touches orders or subscriptions.
+      - It never touches orders or subscriptions.
   - It also runs staff decisions on held charges (approve or decline through `updateHeldTransaction`, audited), and
     records the discrepancies that `checkout` and `billing` report as `payment.unexpected` messages.
-- `checkout` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on outcomes for checkout orders. It also handles returns and refunds, and
-  runs the scheduled-reversal job that sends partial refunds once their charge settles.
-- `billing` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on outcomes for renewal
-  orders. It also runs renewals, retries, the notice job and abandonment.
+- `checkout` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on charge outcomes for
+  checkout orders, and on reversal outcomes (refunds and voids) for every order, renewals included. It also
+  handles returns and refunds, and runs the scheduled-reversal job that sends partial refunds once their charge
+  settles.
+- `billing` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on charge outcomes for
+  renewal orders. It also runs renewals, retries, the notice job and abandonment.
 
 Both consume `payment.outcome` through the inbox, so a repeated message changes nothing.
 
@@ -954,7 +963,9 @@ Both consume `payment.outcome` through the inbox, so a repeated message changes 
 6. On an approved outcome, `checkout` acts:
    - **First, the card.** If the order has a subscription line and the transaction's details carry no payment
      profile, it saves the card with `createCustomerProfileFromTransaction`. This is an outside call, so it comes
-     before the transaction. To be verified in #32.
+     before the transaction. To be verified in #32. If the card can't be saved after three tries over an hour, the
+     order's collection is reversed in full through the refund path, and the order is cancelled with
+     `card_not_saved`. That leaves no subscription without a card and no customer charged for nothing.
    - **Then, in one transaction:**
      - the order becomes `paid`;
      - the session becomes `completed`;
@@ -979,8 +990,10 @@ Both consume `payment.outcome` through the inbox, so a repeated message changes 
    - check that step 2's inputs haven't changed, and if they have, start again from step 2;
    - apply the price change, or mark it `rescheduled`;
    - insert the renewal order, its lines, the new period and its `calculated` tax record;
-   - lower the discount's `cycles_remaining`;
-   - insert a `pending` charge.
+      - lower the discount's `cycles_remaining`;
+   - insert a `pending` charge. If the order's total is zero, insert no charge: the order is `paid` in this same
+     transaction, `paid_through` moves to the period's `period_end`, the tax is recorded, and steps 4 to 6 are
+     skipped.
 4. Call the gateway with the payment profile and `duplicateWindow`.
 5. On approval: the order becomes `paid`, `paid_through` becomes the period's `period_end`, the tax is recorded,
    and a physical product gets a shipment.
@@ -1012,7 +1025,8 @@ Cancelling releases the order's redemption, and its tax record becomes `expired`
 **Sweeps** (`reconcile`), every few minutes:
 - process inbox webhooks, and the `payment.unexpected` messages that become discrepancies, deduplicated through
   the inbox;
-- resolve `unknown` attempts;
+- treat any `pending` row older than 2 minutes (longer than any bounded call) as `unknown`, then resolve every
+  `unknown` row of any kind: charges, refunds, voids and captures;
 - mark holds as `expired` after 5 days;
 - move sessions from `open` to `expired` once `token_expires_at` passes without an approval, and from `expired`
   to `closed` once the unsettled list has been read past them;

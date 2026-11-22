@@ -70,7 +70,8 @@ the decisions that shape it.
   - `billing` handles renewals, retries, the notice job and abandonment.
 
   `checkout` and `billing` may depend on catalog, customers, promotions, orders, subscriptions, tax and payments.
-  Each consumes `payment.outcome` through the inbox, for its own orders. The inbox deduplicates internal messages as
+  Each consumes `payment.outcome` through the inbox: `billing` for charges on renewal orders, `checkout` for
+  charges on checkout orders and for reversals on every order. The inbox deduplicates internal messages as
   well as webhooks.
 - **Money** is a `bigint` count of cents. Each document that owns amounts (a price, an order, a transaction, a
   tax record) carries one `currency char(3)` with `CHECK (currency = 'USD')` (D-2). Percentage discounts are stored
