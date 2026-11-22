@@ -189,7 +189,7 @@ buyer, whether or not they have an account.
 | tax_amount | bigint | Sum of the lines' tax |
 | total_amount | bigint | `CHECK (total_amount = subtotal_amount - discount_amount + shipping_amount + tax_amount)`; the amount due |
 | placed_at | timestamptz | When the order was written; there are no draft orders |
-| paid_at | timestamptz, nullable | Set in the same transaction that makes collected reach the total |
+| paid_at | timestamptz, nullable | Set in the same transaction that makes the order paid: collected reaches the total and, for an order with a subscription line, the card is saved |
 | canceled_at | timestamptz, nullable | |
 | cancel_reason | text, nullable | `abandoned`, `grace_expired` or `staff` |
 | expires_at | timestamptz, nullable | Checkout orders only: `placed_at + 24 hours`, when an unpaid order may be abandoned |
@@ -204,7 +204,7 @@ buyer, whether or not they have an account.
 ```mermaid
 stateDiagram-v2
   [*] --> placed
-  placed --> paid: collected reaches total
+    placed --> paid: collected reaches total (and the card is saved, with a subscription line)
   placed --> canceled: abandoned (checkout) or grace expired (renewal) or staff
   paid --> [*]
   canceled --> [*]
@@ -305,7 +305,8 @@ rules → Refunds).
 | revoke_reason | text, nullable | `refunded`, `chargeback` or `staff` |
 
 - A one-time digital purchase grants an entitlement in the same transaction that marks its order paid.
-- It is revoked once the line's reversals reach its whole `total_amount`, or by a lost chargeback. Reversals are refunds plus voids, summed across all of them.
+- It is revoked once the line's order reversals reach its whole `total_amount`, or by a lost chargeback on the
+  charge that paid for it. Both are counted under the order-sums rule (Payments → What counts as collected).
 - Subscriptions grant access through their own dates (see "Access"), not through entitlements.
 
 ## Promotions
@@ -605,7 +606,7 @@ Stripe payments.
 | Price preview | Stripe calculates. Nothing is stored |
 | Order placed | The calculation's ID and lines are stored as a `calculated` sale, and its tax is frozen on the order lines. The calculation is made before the order's transaction; one that ends up unused simply expires |
 | Order paid | A tax transaction is created from the calculation, with the order number as its reference, and the record becomes `recorded`. A repeated call is refused as a duplicate reference, which makes it idempotent |
-| Order abandoned | Nothing is called. The calculation expires and the record becomes `expired` |
+| Order abandoned, or a renewal cancelled for expired grace | Nothing is called. The calculation expires and the record becomes `expired` |
 | Refund | A reversal is recorded with its own reference, for the refund lines' amounts and tax, as a `return` |
 
 Each calculation takes one customer address: the shipping address when the order has a physical line, otherwise
@@ -644,6 +645,9 @@ customer and payment profile IDs.
 | created_at, completed_at | timestamptz | `completed_at` nullable |
 
 - At most one open session per order: a partial unique index on `order_id` where `status = 'open'`.
+- A session becomes `completed`, from `open`, `expired` or `closed`, when an approval is recorded under it for an
+  order that isn't yet paid. An approval under it for an order that is already paid or cancelled is an unexpected
+  collection instead.
 - A new session may be opened only when all of these hold:
   - the order has no transaction that is `pending`, `unknown` or `held`;
   - it has no collected charge;
@@ -676,7 +680,7 @@ customer and payment profile IDs.
 | submitted_at | timestamptz | |
 | resolved_at | timestamptz, nullable | When the outcome became known |
 | approved_at | timestamptz, nullable | When the gateway approved it; set once, and kept when the row is later voided or settled |
-| unexpected_at | timestamptz, nullable | Set when an approved charge turns out to be an unexpected collection (Charging rules). Such a charge, and its reversal, are left out of collected, reversed and the line caps |
+| unexpected_at | timestamptz, nullable | Set when an approved charge turns out to be an unexpected collection (Charging rules). See the order-sums rule |
 | settled_at | timestamptz, nullable | |
 | expires_at | timestamptz, nullable | Hold expiry (5 days) or authorization expiry (30 days) |
 
@@ -690,7 +694,7 @@ customer and payment profile IDs.
   makes. Hosted attempts have already happened by the time they are recorded, so they are always recorded; the
   session rules keep them to one session at a time.
 - **One open operation per parent:** a unique index on `parent_id` where `kind IN ('refund', 'void', 'capture')`
-  and `status IN ('pending', 'unknown')`. So a void and a refund, or a void and a capture, can't be open on the same
+  and `status IN ('scheduled', 'pending', 'unknown')`. So a void and a refund, or a void and a capture, can't be open on the same
   charge at once.
 
 **Charges and authorizations:**
@@ -716,6 +720,8 @@ stateDiagram-v2
   approved --> expired: authorization not captured in 30 days
 ```
 
+- **Refunds and voids that reverse an order** may also start as `scheduled`: a partial reversal requested before
+  its charge settles waits there until settlement, then becomes `pending` and is sent.
 - **Refunds, voids and captures** go `pending → approved | declined | error | unknown`, and a refund goes
   `approved → settled`. An unknown void or capture is resolved from its parent's transaction details:
   `voided` or `capturedPendingSettlement` means it was approved. An unknown refund is resolved like a charge (below).
@@ -732,7 +738,7 @@ stateDiagram-v2
 | Resolve, then retry | Every charge and refund the backend sends carries `duplicateWindow` 28800 (the maximum, 8 hours). To resolve an unknown one, it is resent unchanged. A duplicate error comes back as response 3 with error 11 and the original `transId`: the backend then reads that transaction's details and takes its status, rather than recording `error`. Past the window, the attempt is looked up by its invoice number in the unsettled list, and in the settled batches since its `submitted_at`. Only a confirmed decline, or confirmed absence from both, allows a new attempt, and a new attempt has a new reference |
 | Holds | A held charge waits for `fraud.approved` or `fraud.declined`, or for a staff decision, which is audited. A sweep marks it `expired` after 5 days. While it waits, nothing else is charged on the order |
 | Voids and captures | A void cancels a whole unsettled charge or authorization. A capture takes up to the authorized amount, once. Each is its own row, pointing at its parent, and on approval the parent's status changes. A void that reverses an order's own collection is a full refund before settlement: it goes through the refund path, with lines, tax reversal, revocations and an audit event. It is used only when every line is reversed in full |
-| Refunds | Only a settled charge, within 180 days, can be refunded; before settlement it can only be voided. Refunds may be partial and repeated, up to the settled amount. A partial reversal requested before settlement waits until the charge settles, normally within a day, and is then issued as a refund; it never becomes a void of the whole charge. No refund is issued on a charge with a `disputed` or `lost` chargeback |
+| Refunds | Only a settled charge, within 180 days, can be refunded; before settlement it can only be voided. Refunds may be partial and repeated, up to the settled amount. A partial reversal requested before settlement is written at once as a `scheduled` refund with its lines, so it counts against the caps and is durable. `checkout`'s scheduled-reversal job sends it once the charge settles, normally within a day. It never becomes a void of the whole charge, and while it waits no other operation can open on that charge. No refund is issued on a charge with a `disputed` or `lost` chargeback |
 | Chargebacks | A row entered by staff, pointing at the disputed charge, with its own generated reference |
 | Unexpected collections | An approval may arrive for an order that is already paid or cancelled, for example a late webhook. The workflow that owns the order sets the charge's `unexpected_at`, and returns the money with a plain void if unsettled or a full refund if settled. That reversal has no `refund_lines`, no tax reversal and no revocations, because nothing the order sold is being returned. In the same transaction, the workflow writes a `payment.unexpected` outbox message, and `reconcile` records the `unexpected_collection` discrepancy for staff. The order's status doesn't change. The zero-total card-saving authorization (Workflows → Checkout) is expected, not unexpected |
 
@@ -746,6 +752,10 @@ stateDiagram-v2
 | Charged back | `amount` of `chargeback` rows that are `lost` |
 | Outstanding | Due minus collected. Reversals and chargebacks are reported beside it and never reopen it, so a `paid` order stays paid and is never charged again |
 
+- **The order-sums rule.** Every sum over an order's transactions leaves out unexpected collections: rows with
+  `unexpected_at` set, and every void, refund or chargeback whose parent has it set. That covers collected,
+  reversed, charged back, the line caps, revocations and the definition of paid. An unexpected collection's own
+  reversal is plain: it has no `refund_lines`, and it neither reverses tax nor revokes anything.
 - An authorization holds funds but collects nothing.
 - A declined, errored, expired or held charge collects nothing. A voided charge that was approved first did collect, and its void counts as a reversal.
 - A capture can be for less than its authorization, so the capture's own amount is what counts.
@@ -755,15 +765,16 @@ stateDiagram-v2
 | Column | Type | Notes |
 | --- | --- | --- |
 | id | bigint, PK | |
-| transaction_id | FK payment_transactions | A reversal: a `refund`, or a `void` of a collected charge. `UNIQUE (transaction_id, order_line_id)` |
+| transaction_id | FK payment_transactions | An order reversal: a `refund`, or a `void`, of a charge the order collected. Reversals of unexpected collections have no lines. `UNIQUE (transaction_id, order_line_id)` |
 | order_line_id | FK order_lines | Which line the money was for, shipping included |
 | amount | bigint | The net amount refunded for the line |
 | tax_amount | bigint | The tax refunded for the line |
 
-- A reversal's `amount` equals the sum of its lines' `amount + tax_amount`. A void covers every line in full.
-- For each order line, `amount + tax_amount` summed over every reversal not `declined` or `error` (pending and
-  unknown ones included) never exceeds the line's `total_amount`. A lost chargeback uses up the rest of its
-  charge's lines. The refund workflow checks this while holding the order row locked, and a constraint trigger
+- An order reversal's `amount` equals the sum of its lines' `amount + tax_amount`. An order void covers every line
+  in full.
+- For each order line, `amount + tax_amount` summed over every order reversal that isn't `declined` or `error`
+  (scheduled, pending and unknown ones included) never exceeds the line's `total_amount`. A lost chargeback on a
+  charge the order collected uses up the rest of that charge's lines. All of this is under the order-sums rule. The refund workflow checks this while holding the order row locked, and a constraint trigger
   checks it again.
 
 ## Reconciliation
@@ -842,10 +853,20 @@ backend call's reference. Each outcome:
 - Checkout and refund requests need the header.
 - The key row is inserted in the same transaction as the effect, with `effect_ref` naming what that transaction
   created (the order, or the reversal).
-- A repeat while the first request is still `in_progress` gets 409 Conflict with `Retry-After`, for up to 1 minute.
-- After 1 minute an `in_progress` key is treated as interrupted. The repeat resumes from `effect_ref`, by
-  re-issuing the hosted token for the order's open session, or by resolving the reversal as an unknown call. It
-  never repeats the effect.
+- A request's whole run is bounded: each gateway call times out after 30 seconds, and the handler's deadline is
+  45 seconds.
+- A repeat while the first request is `in_progress` gets 409 Conflict with `Retry-After`, until 2 minutes have
+  passed. By then the first run has certainly ended.
+- After 2 minutes an `in_progress` key is treated as interrupted, and the repeat resumes from `effect_ref` without
+  repeating the effect:
+  - **Checkout:** if the order is paid, it returns the order. If the order has an open session, it re-issues that
+    session's token. Otherwise it opens a new session under the session rules, or returns the order's current
+    state while an attempt is still unresolved.
+  - **Reversal:** a `scheduled` one is left to its job. A `pending` one may never have been sent, so it is treated
+    as unknown:
+    - a refund is resent unchanged, under `duplicateWindow`;
+    - a void or capture is checked against its parent's details first, and sent only if the parent hasn't
+      changed.
 - A repeat after the request completed gets the stored response.
 
 ### outbox_messages
@@ -908,8 +929,8 @@ then makes the call, then records the outcome.
     - It never touches orders or subscriptions.
   - It also runs staff decisions on held charges (approve or decline through `updateHeldTransaction`, audited), and
     records the discrepancies that `checkout` and `billing` report as `payment.unexpected` messages.
-- `checkout` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on outcomes for checkout
-  orders. It also handles returns and refunds.
+- `checkout` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on outcomes for checkout orders. It also handles returns and refunds, and
+  runs the scheduled-reversal job that sends partial refunds once their charge settles.
 - `billing` (catalog, customers, promotions, orders, subscriptions, tax, payments) acts on outcomes for renewal
   orders. It also runs renewals, retries, the notice job and abandonment.
 
@@ -981,14 +1002,16 @@ Cancelling releases the order's redemption, and its tax record becomes `expired`
 **Return and refund** (`checkout`):
 1. A received return, or a staff decision, picks the lines and amounts.
 2. In one transaction: claim the idempotency key, lock the order, check the caps and any chargeback, insert the
-   `pending` reversal and its lines, and write the audit event. The reversal is a refund if the charge has settled. If it hasn't, the reversal is a void of the whole charge, but
-   only when every line is being reversed in full. A partial reversal waits for settlement.
+      reversal and its lines, and write the audit event. If the charge has settled, the reversal is a `pending`
+   refund. If it hasn't, and every line is being reversed in full, it is a `pending` void of the whole charge.
+   Otherwise it is a `scheduled` refund, which the scheduled-reversal job sends after settlement.
 3. Call the gateway.
 4. On approval, record the tax reversal. If a one-time digital line has now been reversed in full, revoke its
    entitlement. If a subscription's cycle has, end the subscription with `end_reason = 'revoked'`.
 
 **Sweeps** (`reconcile`), every few minutes:
-- process inbox webhooks;
+- process inbox webhooks, and the `payment.unexpected` messages that become discrepancies, deduplicated through
+  the inbox;
 - resolve `unknown` attempts;
 - mark holds as `expired` after 5 days;
 - move sessions from `open` to `expired` once `token_expires_at` passes without an approval, and from `expired`
@@ -1072,8 +1095,9 @@ Someone keys a $75.00 charge directly in the Authorize.Net dashboard. The nightl
    sent 7 to 30 days before that renewal.
 6. Every gateway call is a row before it is sent, and an unknown outcome is resolved, never guessed.
 7. Only one charge may be open on an order at a time, and a paid order is never charged again.
-8. Reversals (refunds, and voids of collected charges) never exceed what a line cost, counting every one that hasn't
-   failed, and none is issued against a disputed or lost chargeback.
+8. Order reversals (refunds, and voids of charges the order collected) never exceed what a line cost, counting
+   every one that hasn't failed. None is issued against a disputed or lost chargeback, and unexpected collections
+   are left out of every sum.
 9. Access follows what was paid for, plus grace while a renewal is uncollected.
 10. Every staff action on money or access is audited.
 11. There is no foreign key between `payment_transactions` and `gateway_transactions`. Either side can exist
@@ -1088,7 +1112,7 @@ Someone keys a $75.00 charge directly in the Authorize.Net dashboard. The nightl
 | What was billed for one subscription? | Its periods' order lines |
 | What was refunded for one subscription? | `refund_lines` against those lines |
 | Which transactions touched a subscription? | Periods, then lines, then orders, then transactions. These are whole-order amounts that can cover other lines, so they are never summed per subscription |
-| Is this order paid? | `status = 'paid'`, the same as outstanding being zero |
+| Is this order paid? | `status = 'paid'`: outstanding is zero, and for an order with a subscription line the card is saved |
 | Can this customer use this product today? | A subscription: see "Access". A one-time digital good: an entitlement with `revoked_at IS NULL` |
 | What has shipped? | `shipment_lines` for shipments that aren't cancelled |
 | How many times was a promotion used? | A count of `promotion_redemptions` with `released_at IS NULL` |

@@ -115,8 +115,10 @@ the decisions that shape it.
     makes, and resolves an unknown one by resending it unchanged. The duplicate error carries the original
     `transId`, whose details give the outcome. Past the window, it checks the unsettled list and the settled batches
     by invoice number before treating the charge as absent.
-  - **Refunds.** Each reversal is split across order lines. Every reversal that hasn't failed counts against a
-    line's total. No refund is issued against a disputed or lost chargeback.
+  - **Refunds.** Each order reversal is split across order lines, and every one that hasn't failed counts against a
+    line's total. A partial reversal before settlement is written at once as a `scheduled` refund, and sent once
+    the charge settles. No refund is issued against a disputed or lost chargeback. Every sum over an order leaves
+    out unexpected collections and their reversals, which are plain and have no lines.
 - **Subscriptions.**
   - **Periods.** A subscription keeps its billing day (`anchor_day`, clamped to the month's length). Each period is
     linked to the one order line that billed it, and the link is unique on the period's start, so a renewal
@@ -149,7 +151,9 @@ the decisions that shape it.
 - **Platform tables.**
   - `idempotency_keys` makes checkout and refund requests replay safely.
   - `outbox_messages` carries notices and domain events.
-  - `inbox_messages` deduplicates webhooks on `notificationId`, after their HMAC-SHA512 signature is verified.
+    - `inbox_messages` deduplicates webhooks on `notificationId`, after their HMAC-SHA512 signature is verified,
+    and the internal messages each workflow consumes (`payment.outcome`, `payment.unexpected`).
+  - `idempotency_keys` resumes an interrupted request from what it created, within bounded timeouts.
   - `audit_events` is append-only and names the actor for every staff action on money or access.
 - **Abandonment.** A checkout order is cancelled 24 hours after it was placed if it has collected nothing, has no
   open attempt and has every session closed. Cancelling it releases its promotion redemption. A renewal whose grace
