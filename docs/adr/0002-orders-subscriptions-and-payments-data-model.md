@@ -50,7 +50,7 @@ the decisions that shape it.
 
   | Domain | Tables |
   | --- | --- |
-  | `catalog` | `products`, `prices` |
+  | `catalog` | `products`, `prices`, `shipping_methods` |
   | `customers` | `customers`, `customer_addresses` |
   | `promotions` | `promotions`, `promotion_products`, `promotion_redemptions` |
   | `orders` | `orders`, `order_addresses`, `order_lines`, `shipments`, `shipment_lines`, `returns`, `return_lines`, `entitlements` |
